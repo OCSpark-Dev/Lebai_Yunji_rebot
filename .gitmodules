@@ -1,0 +1,52 @@
+[submodule "vendor/lebai/sdk/lebai-sdk"]
+	path = vendor/lebai/sdk/lebai-sdk
+	url = https://github.com/lebai-robotics/lebai-sdk.git
+	branch = master
+[submodule "vendor/lebai/sdk/lebai-sdk.rs"]
+	path = vendor/lebai/sdk/lebai-sdk.rs
+	url = https://github.com/lebai-robotics/lebai-sdk.rs.git
+	branch = master
+[submodule "vendor/lebai/sdk/lebai-proto"]
+	path = vendor/lebai/sdk/lebai-proto
+	url = https://github.com/lebai-robotics/lebai-proto.git
+	branch = next
+[submodule "vendor/lebai/legacy/lebai-dotnet-sdk"]
+	path = vendor/lebai/legacy/lebai-dotnet-sdk
+	url = https://github.com/lebai-robotics/lebai-dotnet-sdk.git
+	branch = main
+[submodule "vendor/lebai/ros/lebai-ros-sdk"]
+	path = vendor/lebai/ros/lebai-ros-sdk
+	url = https://github.com/lebai-robotics/lebai-ros-sdk.git
+	branch = main
+[submodule "vendor/lebai/lerobot/lerobot_lebai"]
+	path = vendor/lebai/lerobot/lerobot_lebai
+	url = https://github.com/lebai-robotics/lerobot_lebai.git
+	branch = main
+[submodule "vendor/lebai/examples/example"]
+	path = vendor/lebai/examples/example
+	url = https://github.com/lebai-robotics/example.git
+	branch = main
+[submodule "vendor/lebai/examples/jsonrpc-demo"]
+	path = vendor/lebai/examples/jsonrpc-demo
+	url = https://github.com/lebai-robotics/jsonrpc-demo.git
+	branch = main
+[submodule "vendor/lebai/integrations/OpenClawSkill"]
+	path = vendor/lebai/integrations/OpenClawSkill
+	url = https://github.com/lebai-robotics/OpenClawSkill.git
+	branch = main
+[submodule "vendor/lebai/integrations/plugin"]
+	path = vendor/lebai/integrations/plugin
+	url = https://github.com/lebai-robotics/plugin.git
+	branch = main
+[submodule "vendor/lebai/legacy/lebai-mindplus"]
+	path = vendor/lebai/legacy/lebai-mindplus
+	url = https://github.com/lebai-robotics/lebai-mindplus.git
+	branch = main
+[submodule "vendor/yunji/integrations/yunji_agv_skill"]
+	path = vendor/yunji/integrations/yunji_agv_skill
+	url = https://github.com/lebai-robotics/yunji_agv_skill.git
+	branch = main
+[submodule "vendor/yunji/cloud/open-api"]
+	path = vendor/yunji/cloud/open-api
+	url = https://github.com/yunji-ai/open-api.git
+	branch = master

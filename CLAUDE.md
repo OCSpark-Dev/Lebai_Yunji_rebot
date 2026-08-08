@@ -2,17 +2,23 @@
 
 ## 1. 目录定位
 
-本目录不是代码仓库，而是 **LM3-UP 复合机器人交付资料包**。整机资料分别列出上海乐白 LM3 协作机械臂、LMG-90 夹爪、复合机器人控制箱、RK3588S2 应用主机、“鲁班猫 0wifi”无线视觉模块、RGB 摄像头、云迹 UP 移动底盘和收纳柜等部件；不要在未核对实物接线前把应用主机与无线视觉模块合并视为同一设备。
+本目录是 **LM3-UP 复合机器人资料与 SDK Git 仓库**。整机资料分别列出上海乐白 LM3 协作机械臂、LMG-90 夹爪、复合机器人控制箱、RK3588S2 应用主机、“鲁班猫 0wifi”无线视觉模块、RGB 摄像头、云迹 UP 移动底盘和收纳柜等部件；不要在未核对实物接线前把应用主机与无线视觉模块合并视为同一设备。
 
-- 当前没有 `.git`、源代码、构建脚本、依赖清单或自动化测试。
-- `LM3-UP复合机器人开发资料/` 是便于查阅的展开目录。
+- `LM3-UP复合机器人开发资料/` 保存原始交付 PDF、DOCX、LBD 和 ZIP，不在整理过程中改写。
+- `docs/` 是针对 LM3-UP 整理的开发、SDK、VLA 和真机验收文档。
+- `vendor/` 使用 Git 子模块固定上游乐白 SDK/ROS/插件以及云迹相关公开资料。
+- `scripts/manage-sdks.ps1` 负责可复现初始化和验证子模块；不要直接对全仓执行无差别递归初始化。
+- `examples/read_lm3_status.py` 是默认只读示例，不启动系统或发送运动。
+- 当前仍没有完成的 LM3-UP 整机运行时、WATER 生产客户端、安全协调器或端到端自动化测试；“仓库有 SDK”不等于“已经真机集成”。
 - 根目录 `LM3-UP复合机器人开发资料.zip` 与展开目录内的 11 个文件逐项 SHA-256 一致，是归档快照，不是另一版本。
 - `apriltag.zip` 与 `scene-export-20240801172704538000/` 下的 3 个 `.lbd` 逐字节一致；前者用于整体导入，后者用于审阅具体场景。
 - 本文件总结的是资料中的出厂默认值和示例。**尚未据此证明任何现场机器人的当前 IP、固件版本、地图、标定值或实际运行状态。**
 
-以后处理此目录时，默认保持原始 PDF、DOCX、LBD 和 ZIP 不变；除非用户明确要求，不要重打包、覆盖、改名或重写这些交付文件。
+以后处理此目录时，默认保持原始 PDF、DOCX、LBD 和 ZIP 不变；除非用户明确要求，不要重打包、覆盖、改名或重写这些交付文件。`vendor/` 是上游只读快照：修复应进入可访问的 fork 或主仓独立适配层，不要创建只存在本机、远端无法取得的子模块提交。
 
 ## 2. 资料索引与使用优先级
+
+日常开发先阅读 `docs/README.md`、`docs/LM3-UP开发指南.md` 和 `docs/SDK与子模块.md`；本文件保留更完整的手册事实、冲突项与安全规则。
 
 | 文件 | 页数/形式 | 主要用途 |
 | --- | ---: | --- |
@@ -92,12 +98,12 @@
 
 | 对象 | 默认地址/SSID | 默认凭据或说明 |
 | --- | --- | --- |
-| 复合机器人路由器 | `192.168.10.240`；SSID `LB-AMR-xxxx` | Wi-Fi 密码 `lebairobot` |
-| LM3 有线控制页 | `http://192.168.10.200` | 页面密码 `1111` |
-| LM3 直连 Wi-Fi | SSID `Lebai-XXXXX`；`10.20.17.1` | Wi-Fi 密码 `88888888` |
+| 复合机器人路由器 | `192.168.10.240`；SSID `LB-AMR-xxxx` | 凭据见设备标签/原始手册；投产前改密 |
+| LM3 有线控制页 | `http://192.168.10.200` | 凭据见设备标签/原始手册；投产前改密 |
+| LM3 直连 Wi-Fi | SSID `Lebai-XXXXX`；`10.20.17.1` | 凭据见设备标签/原始手册；投产前改密 |
 | UP 底盘主机 | `192.168.10.10` | 控制网静态地址 |
 | UP 监控/建图页 | `http://192.168.10.10:9001` | 文档未给登录账户 |
-| UP 直连 Wi-Fi | SSID `yunji-WT-xxxxx` | Wi-Fi 密码 `yunjiwater` |
+| UP 直连 Wi-Fi | SSID `yunji-WT-xxxxx` | 凭据见设备标签/原始手册；投产前改密 |
 | WATER TCP API | `192.168.10.10:31001` | TCP socket，不是 HTTP REST |
 | RK 应用主机/插件页 | `http://192.168.10.201/ui/plugin` | 文档未给系统/SSH账户 |
 
@@ -444,9 +450,9 @@ Modbus 位姿编码：xyz 乘 1000 转毫米；角度按一圈映射到 0-65535�
 
 ## 14. 明确的未知项
 
-现有资料没有提供：
+原始交付资料没有提供（`vendor/` 中后来拉取的公开代码不能自动填补整机现场信息）：
 
-- ROS 节点、topic、service、launch 文件或导航栈源码。
+- LM3-UP 整机级 ROS 节点、topic、service、launch 文件或 UP 导航栈源码；乐白公开 ROS 仓库只覆盖机械臂侧。
 - SSH 用户、系统密码、服务名、文件系统部署路径。
 - WATER TCP 消息分帧/终止规则、连接数、超时和心跳协议。
 - `/api/request_data` 在当前协议中的停止订阅、重复请求、频率修改和断线后服务端清理语义；多客户端的控制权、优先级和并发写入仲裁。
@@ -458,3 +464,30 @@ Modbus 位姿编码：xyz 乘 1000 转毫米；角度按一圈映射到 0-65535�
 - 当前现场设备的真实固件、网络、地图和标定状态。
 
 遇到这些问题时，应请求现场信息或读取设备当前状态，不得从截图、文件时间或示例值继续推断。
+
+## 15. SDK 仓库规则与当前结论
+
+### 15.1 初始化
+
+```powershell
+& .\scripts\manage-sdks.ps1
+& .\scripts\manage-sdks.ps1 -VerifyOnly
+```
+
+不要使用全仓 `git submodule update --init --recursive`：云迹旧版 `open-api` 上游包含缺失 `.gitmodules` 映射的 `docs/.vuepress/dist` Git link。脚本只显式递归初始化合法的 `lebai-sdk.rs/proto/lebai-proto`。
+
+### 15.2 选型
+
+- LM3 正式主入口：`vendor/lebai/sdk/lebai-sdk`；Python 使用 `pylebai`，控制器软件要求至少 3.1.5。
+- UP 正式依据：交付 `water_api手册.pdf`。没有发现云迹官方公开的 WATER/UP SDK 或 ROS 驱动。
+- ROS：`vendor/lebai/ros/lebai-ros-sdk` 的 `main` 是文档分支，代码在 Humble/Jazzy/Lyrical 等发行版分支；不包含 UP/Nav2/WATER。
+- RK 视觉：结合 `vendor/lebai/integrations/plugin`、RK 指南和交付 LBD 使用。
+
+### 15.3 不能直接投产的上游代码
+
+- `vendor/lebai/lerobot/lerobot_lebai` 固定版本的 `lebai.py:76` 存在 Python 语法错误；还会在连接/断开时自动启停系统，没有校准、动作限幅、等待完成、碰撞或底盘动作空间。只能作为重写适配器的参考。
+- `vendor/yunji/integrations/yunji_agv_skill` 由乐白而非云迹发布；监听线程和同步请求会在同一 socket 上竞争 `recv`，并硬假设换行分帧。WATER 手册没有给出这一分帧保证，不能直接作为生产控车层。
+- `vendor/yunji/cloud/open-api` 是旧机器人服务生云端业务 API，不是 UP/WATER 控制 SDK。
+- `vendor/lebai/integrations/OpenClawSkill` 是智能体工具封装，不是安全边界；不得让模型直接调用运动、关机、解除急停或破坏性配置接口。
+
+详细分级、许可证和修复策略见 `docs/SDK与子模块.md` 与 `vendor/README.md`。
