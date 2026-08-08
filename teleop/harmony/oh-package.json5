@@ -1,0 +1,11 @@
+{
+  "modelVersion": "26.0.0",
+  "name": "lm3-up-harmony-teleop",
+  "version": "1.0.0",
+  "description": "Fail-closed low-speed LM3-UP Cartesian teleoperation client.",
+  "dependencies": {},
+  "devDependencies": {
+    "@ohos/hypium": "1.0.25",
+    "@ohos/hamock": "1.0.0"
+  }
+}

@@ -74,6 +74,7 @@ git submodule status
 ```powershell
 & .\scripts\manage-sdks.ps1 -UpdateRemote
 git status --short
+git diff --submodule=log
 ```
 
-远程更新会改变主仓库记录的子模块提交。更新后应分别审阅上游变更、许可证和真实设备兼容性，再决定是否提交。
+远程更新会移动子模块工作树，但不会自动暂存父仓库 gitlink；脚本会报告父仓索引到新 HEAD 的差异。更新后应分别审阅上游变更、许可证和真实设备兼容性，只暂存确认过的子模块路径。

@@ -29,6 +29,10 @@ if (-not (Test-Path -LiteralPath $gitModules)) {
     throw "Missing .gitmodules under $repoRoot"
 }
 
+if ($UpdateRemote -and $VerifyOnly) {
+    throw '-UpdateRemote and -VerifyOnly cannot be used together.'
+}
+
 if (-not $VerifyOnly) {
     Invoke-Git -Arguments @('submodule', 'sync') | Out-Host
 
@@ -46,9 +50,10 @@ if (-not $VerifyOnly) {
 }
 
 $topLevelStatus = @(Invoke-Git -Arguments @('submodule', 'status'))
-$badTopLevel = @($topLevelStatus | Where-Object { $_ -match '^[+\-U]' })
+$invalidTopLevelPattern = if ($UpdateRemote) { '^[-U]' } else { '^[+\-U]' }
+$badTopLevel = @($topLevelStatus | Where-Object { $_ -match $invalidTopLevelPattern })
 if ($badTopLevel.Count -gt 0) {
-    throw "Top-level submodule state is not pinned/initialized:`n$($badTopLevel -join "`n")"
+    throw "Top-level submodule state is not initialized/usable:`n$($badTopLevel -join "`n")"
 }
 
 $records = @(Invoke-Git -Arguments @('config', '-f', '.gitmodules', '--get-regexp', '^submodule\..*\.path$'))
@@ -63,6 +68,12 @@ foreach ($record in $records) {
     if (-not (Test-Path -LiteralPath $fullPath)) {
         throw "Missing submodule path: $relativePath"
     }
+
+    $indexEntries = @(Invoke-Git -Arguments @('ls-files', '--stage', '--', $relativePath))
+    if ($indexEntries.Count -ne 1 -or $indexEntries[0] -notmatch '^160000\s+([0-9a-fA-F]{40,64})\s+\d+\t') {
+        throw "Submodule path is not recorded as one mode-160000 gitlink in the parent index: $relativePath"
+    }
+    $indexCommit = $Matches[1].ToLowerInvariant()
 
     $expectedUrl = (Invoke-Git -Arguments @('config', '-f', '.gitmodules', '--get', "submodule.$name.url")) -join ''
     $actualUrl = (Invoke-Git -WorkingDirectory $fullPath -Arguments @('remote', 'get-url', 'origin')) -join ''
@@ -80,8 +91,17 @@ foreach ($record in $records) {
         throw "Submodule is dirty: $relativePath"
     }
 
-    $commit = ((Invoke-Git -WorkingDirectory $fullPath -Arguments @('rev-parse', '--short=12', 'HEAD')) -join '').Trim()
-    Write-Host "OK  $relativePath  $commit  files=$($trackedFiles.Count)"
+    $headCommit = ((Invoke-Git -WorkingDirectory $fullPath -Arguments @('rev-parse', 'HEAD')) -join '').Trim().ToLowerInvariant()
+    if ($headCommit -ne $indexCommit) {
+        if (-not $UpdateRemote) {
+            throw "Submodule HEAD does not match the parent index for $relativePath. Index '$indexCommit', HEAD '$headCommit'."
+        }
+        Write-Host "UPDATE  $relativePath  $($indexCommit.Substring(0, 12)) -> $($headCommit.Substring(0, 12))"
+    }
+    else {
+        $commit = $headCommit.Substring(0, 12)
+        Write-Host "OK  $relativePath  $commit  files=$($trackedFiles.Count)"
+    }
     $verified++
 }
 
@@ -106,6 +126,12 @@ foreach ($branch in $requiredRosBranches) {
     }
 }
 
-Write-Host "Verified $verified top-level SDK/integration submodules."
+if ($UpdateRemote) {
+    Write-Host "Checked $verified updated top-level SDK/reference submodules."
+    Write-Host 'Parent gitlinks are not staged automatically; review git diff --submodule=log and stage only approved paths.'
+}
+else {
+    Write-Host "Verified $verified pinned top-level SDK/reference submodules."
+}
 Write-Host 'Note: yunji/cloud/open-api contains an upstream malformed docs/.vuepress/dist gitlink.'
 Write-Host 'The script intentionally initializes only the legitimate nested lebai-sdk.rs/proto/lebai-proto module.'

@@ -1,0 +1,498 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/surface"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="14dp">
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="LM3-UP 安全遥操"
+            android:textColor="@color/navy"
+            android:textSize="26sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="lm3-teleop.v1 · 笛卡尔低速控制"
+            android:textColor="@color/text_secondary"
+            android:textSize="14sp" />
+
+        <TextView
+            android:id="@+id/safetyBanner"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:background="@drawable/bg_safety_banner"
+            android:text="软件停止不能替代物理急停。仅在现场监护、工作区清空、底盘锁定且急停可触达时解锁。"
+            android:textColor="@color/amber"
+            android:textSize="14sp"
+            android:textStyle="bold" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:background="@drawable/bg_panel"
+            android:orientation="vertical">
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="1. 连接"
+                android:textColor="@color/text_primary"
+                android:textSize="19sp"
+                android:textStyle="bold" />
+
+            <EditText
+                android:id="@+id/endpointInput"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:autofillHints="none"
+                android:hint="wss://网关地址/teleop（开发可用局域网 ws://）"
+                android:imeOptions="actionNext"
+                android:inputType="textUri"
+                android:maxLines="1"
+                android:textSize="15sp" />
+
+            <EditText
+                android:id="@+id/clientNameInput"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:autofillHints="name"
+                android:hint="操作者/终端名称"
+                android:imeOptions="actionNext"
+                android:inputType="textPersonName"
+                android:maxLines="1"
+                android:textSize="15sp" />
+
+            <EditText
+                android:id="@+id/tokenInput"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:hint="共享 token（不会持久化）"
+                android:importantForAutofill="no"
+                android:imeOptions="actionDone"
+                android:inputType="textPassword"
+                android:maxLines="1"
+                android:saveEnabled="false"
+                android:textSize="15sp" />
+
+            <TextView
+                android:id="@+id/transportWarning"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="生产环境请使用 WSS。debug 版仅允许对私有/环回地址使用 ws://。"
+                android:textColor="@color/amber"
+                android:textSize="12sp" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/connectButton"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="连接" />
+
+                <Button
+                    android:id="@+id/disconnectButton"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:layout_weight="1"
+                    android:enabled="false"
+                    android:text="安全断开" />
+            </LinearLayout>
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:background="@drawable/bg_panel"
+            android:orientation="vertical">
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="2. 状态"
+                android:textColor="@color/text_primary"
+                android:textSize="19sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/statusText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:fontFamily="monospace"
+                android:text="连接: 未连接\n认证: 未完成\n底盘锁定: 未知\n看门狗: 未知\n控制权: 无\n录制: 未录制"
+                android:textColor="@color/text_primary"
+                android:textIsSelectable="true"
+                android:textSize="13sp" />
+
+            <TextView
+                android:id="@+id/lastEventText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="等待连接"
+                android:textColor="@color/text_secondary"
+                android:textSize="12sp" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:background="@drawable/bg_panel"
+            android:orientation="vertical">
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="3. 安全检查与解锁"
+                android:textColor="@color/text_primary"
+                android:textSize="19sp"
+                android:textStyle="bold" />
+
+            <CheckBox
+                android:id="@+id/baseStationaryCheck"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="UP 底盘已停止且锁定" />
+
+            <CheckBox
+                android:id="@+id/workspaceClearCheck"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="机械臂工作区已清空" />
+
+            <CheckBox
+                android:id="@+id/estopAccessibleCheck"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="现场监护人可直接触达物理急停" />
+
+            <CheckBox
+                android:id="@+id/toolSecureCheck"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="夹爪、相机、工具和线缆固定可靠" />
+
+            <ProgressBar
+                android:id="@+id/unlockProgress"
+                style="?android:attr/progressBarStyleHorizontal"
+                android:layout_width="match_parent"
+                android:layout_height="8dp"
+                android:layout_marginTop="8dp"
+                android:max="100"
+                android:progress="0" />
+
+            <Button
+                android:id="@+id/unlockHoldButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:enabled="false"
+                android:text="按住 1.5 秒申请控制权" />
+
+            <Button
+                android:id="@+id/releaseButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:enabled="false"
+                android:text="停止并释放控制权" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:background="@drawable/bg_panel"
+            android:orientation="vertical">
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="4. 笛卡尔低速运动"
+                android:textColor="@color/text_primary"
+                android:textSize="19sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="先点选一个方向，再持续按住绿色 deadman。松手或触摸取消会立即发送 motion.stop。"
+                android:textColor="@color/text_secondary"
+                android:textSize="12sp" />
+
+            <RadioGroup
+                android:id="@+id/speedGroup"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:orientation="horizontal">
+
+                <RadioButton
+                    android:id="@+id/speedCreep"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:checked="true"
+                    android:text="爬行" />
+
+                <RadioButton
+                    android:id="@+id/speedLow"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="低速" />
+
+                <RadioButton
+                    android:id="@+id/speedCareful"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="谨慎上限" />
+            </RadioGroup>
+
+            <TextView
+                android:id="@+id/speedDescription"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="线速度 0.005 m/s · 角速度 0.02 rad/s"
+                android:textColor="@color/text_secondary"
+                android:textSize="12sp" />
+
+            <TextView
+                android:id="@+id/selectedMotionText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="已选择: X+（基坐标系）"
+                android:textColor="@color/blue_dark"
+                android:textSize="15sp"
+                android:textStyle="bold" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+                <TextView android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:text="X 前后" android:textStyle="bold" />
+                <Button android:id="@+id/xMinusButton" android:layout_width="80dp" android:layout_height="wrap_content" android:text="X−" />
+                <Button android:id="@+id/xPlusButton" android:layout_width="80dp" android:layout_height="wrap_content" android:text="X+" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+                <TextView android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:text="Y 左右" android:textStyle="bold" />
+                <Button android:id="@+id/yMinusButton" android:layout_width="80dp" android:layout_height="wrap_content" android:text="Y−" />
+                <Button android:id="@+id/yPlusButton" android:layout_width="80dp" android:layout_height="wrap_content" android:text="Y+" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+                <TextView android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:text="Z 上下" android:textStyle="bold" />
+                <Button android:id="@+id/zMinusButton" android:layout_width="80dp" android:layout_height="wrap_content" android:text="Z−" />
+                <Button android:id="@+id/zPlusButton" android:layout_width="80dp" android:layout_height="wrap_content" android:text="Z+" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+                <TextView android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:text="Rx 滚转" android:textStyle="bold" />
+                <Button android:id="@+id/rxMinusButton" android:layout_width="80dp" android:layout_height="wrap_content" android:text="Rx−" />
+                <Button android:id="@+id/rxPlusButton" android:layout_width="80dp" android:layout_height="wrap_content" android:text="Rx+" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+                <TextView android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:text="Ry 俯仰" android:textStyle="bold" />
+                <Button android:id="@+id/ryMinusButton" android:layout_width="80dp" android:layout_height="wrap_content" android:text="Ry−" />
+                <Button android:id="@+id/ryPlusButton" android:layout_width="80dp" android:layout_height="wrap_content" android:text="Ry+" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+                <TextView android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:text="Rz 偏航" android:textStyle="bold" />
+                <Button android:id="@+id/rzMinusButton" android:layout_width="80dp" android:layout_height="wrap_content" android:text="Rz−" />
+                <Button android:id="@+id/rzPlusButton" android:layout_width="80dp" android:layout_height="wrap_content" android:text="Rz+" />
+            </LinearLayout>
+
+            <TextView
+                android:id="@+id/deadmanButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:background="@drawable/bg_deadman"
+                android:clickable="true"
+                android:enabled="false"
+                android:focusable="true"
+                android:gravity="center"
+                android:text="按住以运动（DEADMAN）"
+                android:textColor="@android:color/white"
+                android:textSize="18sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/stopButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:background="@drawable/bg_stop"
+                android:clickable="true"
+                android:focusable="true"
+                android:gravity="center"
+                android:text="立即停止"
+                android:textColor="@android:color/white"
+                android:textSize="18sp"
+                android:textStyle="bold" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:background="@drawable/bg_panel"
+            android:orientation="vertical">
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="5. 夹爪"
+                android:textColor="@color/text_primary"
+                android:textSize="19sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/gripperValueText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="目标开度: 50%"
+                android:textColor="@color/text_primary" />
+
+            <SeekBar
+                android:id="@+id/gripperSeekBar"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:max="100"
+                android:progress="50" />
+
+            <Button
+                android:id="@+id/gripperHoldButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:enabled="false"
+                android:text="按住发送夹爪目标" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text="注意：松手/断线只会请求 stop_move；当前未验证可中途停止夹爪。"
+                android:textColor="@color/red"
+                android:textSize="12sp" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:layout_marginBottom="24dp"
+            android:background="@drawable/bg_panel"
+            android:orientation="vertical">
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="6. 数据录制"
+                android:textColor="@color/text_primary"
+                android:textSize="19sp"
+                android:textStyle="bold" />
+
+            <EditText
+                android:id="@+id/taskInput"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:hint="任务文本（必填）"
+                android:inputType="textCapSentences|textMultiLine"
+                android:maxLines="3" />
+
+            <EditText
+                android:id="@+id/episodeInput"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:hint="episode_id（可选）"
+                android:inputType="text"
+                android:maxLines="1" />
+
+            <CheckBox
+                android:id="@+id/wristCameraCheck"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:checked="true"
+                android:text="camera_wrist（末端 UVC）" />
+
+            <CheckBox
+                android:id="@+id/sceneCameraCheck"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="camera_top（外部环境相机）" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/recordStartButton"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:enabled="false"
+                    android:text="开始录制" />
+
+                <Button
+                    android:id="@+id/recordStopButton"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:layout_weight="1"
+                    android:enabled="false"
+                    android:text="停止录制" />
+            </LinearLayout>
+        </LinearLayout>
+    </LinearLayout>
+</ScrollView>

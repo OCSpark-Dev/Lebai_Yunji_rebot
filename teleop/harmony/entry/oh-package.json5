@@ -1,0 +1,9 @@
+{
+  "name": "entry",
+  "version": "1.0.0",
+  "description": "LM3-UP low-speed Cartesian teleoperation entry module.",
+  "main": "",
+  "author": "OCSpark",
+  "license": "Apache-2.0",
+  "dependencies": {}
+}

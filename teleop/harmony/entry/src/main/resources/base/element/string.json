@@ -1,0 +1,7 @@
+{
+  "string": [
+    { "name": "module_desc", "value": "LM3-UP 安全笛卡尔遥操" },
+    { "name": "EntryAbility_desc", "value": "LM3-UP 安全笛卡尔遥操" },
+    { "name": "EntryAbility_label", "value": "LM3-UP 遥操" }
+  ]
+}

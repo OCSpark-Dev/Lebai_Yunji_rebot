@@ -1,0 +1,49 @@
+[server]
+host = "127.0.0.1"
+port = 8765
+path = "/ws"
+auth_token_env = "LM3_TELEOP_TOKEN"
+allow_lan = false
+state_hz = 20
+max_message_age_ms = 2000
+max_future_skew_ms = 5000
+lease_ms = 2000
+
+[robot]
+backend = "simulator"
+robot_ip = ""
+pylebai_path = ""
+base_locked = true
+hardware_enabled = false
+cartesian_acceleration_mps2 = 0.1
+gripper_force_pct = 20.0
+emergency_stop_port = 3031
+emergency_stop_timeout_ms = 200
+
+[safety]
+command_rate_hz = 20
+watchdog_ms = 300
+feedback_stall_ms = 250
+max_linear_mps = 0.03
+max_angular_rps = 0.15
+max_command_duration_ms = 150
+min_command_duration_ms = 20
+workspace_configured = true
+workspace_min_m = [0.10, -0.60, 0.02]
+workspace_max_m = [0.80, 0.60, 0.80]
+joint_limits_configured = true
+joint_min_rad = [-6.283, -6.283, -6.283, -6.283, -6.283, -6.283]
+joint_max_rad = [6.283, 6.283, 6.283, 6.283, 6.283, 6.283]
+joint_limit_margin_rad = 0.05
+# Protocol v1 fixes this allowlist to official IDLE=5 and MOVING=7.
+allowed_robot_states = [5, 7]
+
+[recording]
+root = "../data/raw"
+fps = 20
+
+# Optional UVC cameras require: pip install -e ".\teleop\bridge[camera]"
+# [cameras.camera_wrist]
+# source = "0"
+# fps = 20
+# jpeg_quality = 90

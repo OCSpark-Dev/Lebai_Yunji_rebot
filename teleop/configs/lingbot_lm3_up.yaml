@@ -1,0 +1,33 @@
+# Copy this file to LingBot-VLA as configs/robot_configs/lm3_up.yaml.
+# Raw LeRobot features are [q1..q6, gripper] for both state and next-state action.
+states:
+  - observation.state.arm.position:
+      origin_keys:
+        - observation.state:
+            start: 0
+            end: 6
+
+  - observation.state.effector.position:
+      origin_keys:
+        - observation.state:
+            start: 6
+            end: 7
+
+actions:
+  - action.arm.position:
+      origin_keys:
+        - action:
+            start: 0
+            end: 6
+      subtract_state: true
+
+  - action.effector.position:
+      origin_keys:
+        - action:
+            start: 6
+            end: 7
+      subtract_state: false
+
+images:
+  - observation.images.camera_top
+  - observation.images.camera_wrist

@@ -2,7 +2,7 @@
 
 ## 1. 初始化和验证
 
-主仓库固定 13 个顶层子模块。使用统一脚本初始化真正需要的嵌套依赖并检查远端、提交、文件和 ROS 分支：
+主仓库固定 14 个顶层子模块：13 个 `vendor/` SDK/参考仓库和 1 个 `Seeed-Studio/wiki-documents` 文档站快照。使用统一脚本初始化真正需要的嵌套依赖，并在本地检查父仓 `160000` gitlink、配置的 `origin` URL、固定提交、文件和已有 ROS 远端引用；`-VerifyOnly` 不联网验证上游可取性：
 
 ```powershell
 & .\scripts\manage-sdks.ps1
@@ -61,14 +61,16 @@
 
 ## 3. 机械臂 Python 的安全起点
 
-安装官方包：
+Windows 真机绑定优先使用 **CPython 3.11 或 3.12**，并确认下载到与解释器 ABI 匹配的官方 `pylebai` wheel；不要因为本机已有更新版 Python 就假定原生扩展可用。若安装了 Python Launcher，可使用：
 
 ```powershell
-py -m venv .venv
+py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 python -m pip install pylebai
 ```
+
+若没有 `py` 命令，改用已安装的 Python 3.11/3.12 `python.exe` 完整路径创建虚拟环境。安装后必须在目标机器执行 `python -c "from pylebai import Robot"`，确认原生扩展可导入；仓库中的 SDK 源码目录不能代替已构建 wheel。
 
 先运行只读示例，不启动系统、不发送运动：
 
@@ -120,6 +122,6 @@ git submodule update -- vendor/lebai/ros/lebai-ros-sdk
 ## 6. 更新策略
 
 - 普通开发使用主仓库固定的子模块提交，不追随上游浮动分支。
-- 执行 `manage-sdks.ps1 -UpdateRemote` 后，逐仓库检查 API、许可证和兼容性。
+- 执行 `manage-sdks.ps1 -UpdateRemote` 后，脚本允许并报告父仓索引与新子模块 HEAD 的差异，但不会自动暂存 gitlink；必须用 `git diff --submodule=log` 逐仓库检查 API、许可证和兼容性，再只暂存确认过的路径。
 - 不要在子模块内创建只存在本机的提交再让主仓库引用；远端克隆将无法取得该提交。
 - 对上游缺陷应提交到可访问的 fork，或在主仓库维护独立适配层和补丁说明。

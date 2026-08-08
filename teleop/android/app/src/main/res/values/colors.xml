@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="navy">#10253F</color>
+    <color name="blue">#1769AA</color>
+    <color name="blue_dark">#0D4778</color>
+    <color name="green">#18794E</color>
+    <color name="amber">#A15C00</color>
+    <color name="red">#B42318</color>
+    <color name="surface">#F5F7FA</color>
+    <color name="panel">#FFFFFF</color>
+    <color name="border">#CCD5DF</color>
+    <color name="text_primary">#17212B</color>
+    <color name="text_secondary">#52616F</color>
+    <color name="disabled">#9AA7B2</color>
+</resources>

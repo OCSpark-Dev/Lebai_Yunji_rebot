@@ -2,12 +2,15 @@
 
 本仓库面向 **上海乐白 LM3-UP 复合机器人**。整机由乐白 LM3 六轴协作机械臂、LMG-90 夹爪、RK3588S2 应用/视觉主机、RGB 相机和云迹 UP 移动底盘组成。
 
-仓库保存两类内容：
+仓库保存三类内容：
 
 - 原始交付资料：PDF、DOCX、AprilTag 打印文件和乐白场景程序，保持原样归档。
 - 上游开发资源：乐白 SDK、ROS/LeRobot/插件仓库，以及目前可确认的云迹相关公开接口资料，使用 Git 子模块固定版本。
+- LM3-UP 专用研发代码：Android/HarmonyOS 手机遥操客户端、默认仿真的 Python 安全桥，以及 VLA 原始数据记录与导出链路。
 
-> 当前状态是“资料与 SDK 基线”，不是已经完成的整机控制程序。仓库没有声称通过 LM3-UP 真机运动、地图、抓取或 VLA 端到端验证。
+> 手机遥操代码默认只连接模拟后端。仓库没有声称通过 LM3-UP 真机运动、地图、抓取或 VLA 端到端验证；真机启用必须完成现场配置与验收清单。
+
+> 仓库根目录未设置统一 LICENSE。原始交付资料及没有明确根许可证的上游仓库，其公开再发布、修改和商用权利尚未由本仓库确认；推送到远端不等于向第三方授予许可，公开分发前应由权利方确认。
 
 ## 快速开始
 
@@ -30,9 +33,10 @@ Set-Location Lebai_Yunji_rebot
 ```powershell
 & .\scripts\manage-sdks.ps1 -UpdateRemote
 git status --short
+git diff --submodule=log
 ```
 
-远程更新会改变主仓库记录的子模块提交，必须审阅后再提交。
+远程更新会移动各子模块工作树，但不会自动暂存父仓库 gitlink。脚本会报告父仓索引到新 HEAD 的差异；必须逐项审阅 API、许可证和兼容性，只暂存确认过的子模块路径后再提交。
 
 ## 文档
 
@@ -42,6 +46,8 @@ git status --short
 | [LM3-UP 开发指南](docs/LM3-UP开发指南.md) | 整机组成、网络、控制分层和实施路线 |
 | [SDK 与子模块指南](docs/SDK与子模块.md) | SDK 分级、初始化、版本选择和已知缺陷 |
 | [LingBot-VLA 接入评估](docs/LingBot-VLA接入评估.md) | 能否用于 LM3-UP、缺口、建议架构和安全门槛 |
+| [手机遥操与 VLA 数据采集](docs/手机遥操与VLA数据采集.md) | Seeed/Phosphobot 原理、三端架构、协议、数据与训练路径 |
+| [遥操实现](teleop/README.md) | Python 桥、Android、HarmonyOS 的构建和模拟使用方法 |
 | [真机联调与验收清单](docs/真机联调与验收清单.md) | 首次连接、低速测试、地图、视觉和 VLA 验收记录 |
 | [CLAUDE.md](CLAUDE.md) | 面向代码助手的完整手册事实、风险与操作约束 |
 | [vendor/README.md](vendor/README.md) | 上游仓库来源、许可证和固定版本说明 |
@@ -53,6 +59,8 @@ LM3-UP复合机器人开发资料/   原始交付手册、场景和标签文件
 docs/                       针对本机型整理的开发文档
 examples/                   默认只读的安全示例
 scripts/                    SDK 初始化和完整性验证脚本
+Seeed-Studio/               Wiki 固定版本与手机遥操原理分析
+teleop/                     Android、HarmonyOS、安全桥、协议和 VLA 数据配置
 vendor/lebai/               乐白官方 SDK、ROS、插件与示例
 vendor/yunji/               云迹公开云 API 及乐白发布的 WATER 参考客户端
 ```

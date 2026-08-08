@@ -50,3 +50,7 @@
 	path = vendor/yunji/cloud/open-api
 	url = https://github.com/yunji-ai/open-api.git
 	branch = master
+[submodule "Seeed-Studio/wiki-documents"]
+	path = Seeed-Studio/wiki-documents
+	url = https://github.com/Seeed-Studio/wiki-documents.git
+	branch = docusaurus-version

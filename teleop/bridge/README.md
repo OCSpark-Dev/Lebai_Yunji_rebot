@@ -1,0 +1,110 @@
+# LM3-UP Python 安全桥
+
+该服务把 Android/HarmonyOS 的 `lm3-teleop.v1` WebSocket 意图转换为受限 LM3 动作，并记录可审计的原始示范。默认只运行模拟器；任何真机模式都需要配置文件和 CLI 双重显式启用。
+
+## 已实现的安全层
+
+- 共享 token，首帧 `session.hello`，每连接双向 `seq=0` 起严格递增；
+- 单一控制租约、1500 ms 客户端长按声明和四项现场检查；租约配置/请求范围为 500–2000 ms，服务端上限始终为 2000 ms；
+- 只有乐白官方状态码 `5 (IDLE)` 可取得租约，`7 (MOVING)` 和其他状态一律拒绝；
+- 严格单槽 20 Hz token-bucket 限速，不允许客户端靠积攒令牌突发双发；另有 300 ms 独立 watchdog；
+- 连续有效的非零笛卡尔命令期间，若关节与 TCP 反馈在配置窗口内持续无可观测变化，则撤租、停止并报告 `FEEDBACK_STALLED`；
+- 过期/未来/乱序消息、非有限数值、错误 deadman、无租约和错误坐标系失败关闭；
+- 速度向量范数钳制、有限持续时间、六轴限位余量和 TCP 当前/预测工作空间检查；
+- 任何已认证的 `motion.stop` 都优先执行，即使其 seq 或 body 随后被判无效；非控制者发起停止时还会撤销当前控制租约，防止原控制端沿用旧租约恢复；
+- 断连、租约过期、机器人状态异常或后端异常会先撤销控制权，再通过独立停止通道请求 `stop_move()`；
+- 不调用 `start_sys()`、`stop_sys()`、解除急停、关机或底盘控制接口；
+- `gripper.set` 的 deadman 只授权一次目标下发；当前没有经真机验证的夹爪中途停止路径，`stop_move` 不能据此视为会停止 LMG-90；
+- 原始 episode、相机时间、异常标志和覆盖 episode 全部文件的 `manifest.sha256`；
+- 使用官方 LeRobot v0.4.2 API 的可选 v3 导出器。
+
+## 安装和模拟启动
+
+在仓库根目录运行：
+
+```powershell
+python -m venv .\tmp\lm3-teleop-venv
+& .\tmp\lm3-teleop-venv\Scripts\python.exe -m pip install -e ".\teleop\bridge[test]"
+
+$env:LM3_TELEOP_TOKEN = 'replace-with-at-least-16-random-characters'
+& .\tmp\lm3-teleop-venv\Scripts\python.exe -m lm3_teleop_bridge serve `
+  --config .\teleop\configs\lm3-up.sim.toml
+```
+
+默认地址是 `ws://127.0.0.1:8765/ws`。实体手机无法访问宿主机环回地址；在完成隔离网络和 WSS 前，优先用本机测试客户端或模拟器验证。
+
+## 真机启动门槛
+
+复制 `teleop/configs/lm3-up.hardware.template.toml` 为不提交的 `.local.toml`，完成以下所有字段：
+
+- `robot_ip` 是现场发现的 LM3 控制器地址；
+- 安装与当前 Python 版本匹配、已经构建完成的 `pylebai` wheel；如果使用 `pylebai_path`，它必须指向可导入 `pylebai` 且包含原生扩展 `l_master` 的构建产物目录，SDK 源码 `python` 目录本身不能直接使用；
+- `base_locked=true` 目前只是启动前由独立底盘流程给出的现场声明，不是持续读取的 UP 硬件互锁；真机接入前必须补独立确定性互锁与状态刷新；
+- `workspace_min_m`/`workspace_max_m` 是实际工具、夹具和场景下测得的 TCP 界限；
+- `joint_min_rad`/`joint_max_rad` 是厂商/现场确认的六轴软限位，并保留安全余量；
+- `workspace_configured=true`、`joint_limits_configured=true`、`hardware_enabled=true`；
+- 现场人员已上使能、检查急停并掌握物理急停。
+
+然后仍必须传 `--hardware`。如果监听局域网，还要配置 `allow_lan=true` 并传 `--allow-lan`。桥接器不会替操作者上使能或复位急停。
+
+### 停止时序和现实边界
+
+硬件后端的状态、`speedl` 和夹爪等普通调用仍经过 `pylebai`，SDK/HTTP 调用可能因 Windows 调度、Python 线程、网络或控制器响应而延迟。桥接器因此把停止从普通后端锁中分离，并默认直接向控制器 `3031` 端口发送 `stop_move` JSON-RPC，软件 deadline 为 `200 ms`（由 `emergency_stop_port` 和 `emergency_stop_timeout_ms` 配置）；只有收到匹配 JSON-RPC 版本、请求 ID 和 `result` 的成功响应才视为确认。停止发生时还会使当前安全 epoch 失效；如果较早的 `speedl` 调用稍后才返回，桥接器会再次请求停止，且不会把旧命令重新标记为活动运动。
+
+这仍然不是硬实时系统，也不是控制器的物理急停保证。真机使用必须同时保留有限的 `speedl` 持续时间、独立软件停止通道、可触达的物理急停和现场监护；不得把“200 ms 软件 deadline”解释为机械臂必然在 200 ms 内物理停住。
+
+## 相机和原始数据
+
+安装 OpenCV extra 后可在 TOML 中配置 `camera_top`/`camera_wrist` 的 UVC index、URL 或视频源：
+
+```powershell
+& .\tmp\lm3-teleop-venv\Scripts\python.exe -m pip install -e ".\teleop\bridge[camera]"
+```
+
+相机工作线程只更新最新 JPEG，控制/看门狗协程不会等待 UVC 读取。打开失败、读取失败和未配置都会写入原始帧的 `camera_status`，不会伪造图像。
+
+两份模板默认没有启用相机段。桥接器会拒绝未配置或空的相机列表，因此默认模拟启动可验证控制但不能开始 episode 录制；录制前必须显式配置至少 `camera_wrist`（可选 `camera_top`）。当前不提供无图像录制模式。
+
+每个完成 episode 包含：
+
+```text
+metadata.json
+frames.jsonl
+images/<camera>/...
+manifest.sha256
+```
+
+验证完整性：
+
+```powershell
+python -m lm3_teleop_bridge verify .\teleop\data\raw\episode-id
+```
+
+校验器要求 manifest 非空、SHA-256 为 64 位十六进制、路径不得绝对化/穿越/逃逸或重复，且 `metadata.json`、`frames.jsonl` 和所有图像等实际文件必须被完整且精确覆盖。录制 `fps` 必须与服务端 `state_hz` 一致，避免元数据声称的采样率与真实状态循环不符。
+
+## 导出 LeRobot v3
+
+导出器调用 LeRobot v0.4.2 的 `LeRobotDataset.create/add_frame/save_episode/finalize`，不会手写 Parquet。它把当前实际状态映射为 `observation.state=[q1..q6,gripper]`，把下一帧实际状态映射为 `action`，并保留手机笛卡尔速度和原始时间特征。
+
+```powershell
+python -m pip install -e ".\teleop\bridge[export]"
+python -m lm3_teleop_bridge export `
+  --episode .\teleop\data\raw\episode-a `
+  --episode .\teleop\data\raw\episode-b `
+  --output D:\datasets\lm3-up-v1 `
+  --repo-id local/lm3_up `
+  --camera camera_top `
+  --camera camera_wrist
+```
+
+导出器先验证 manifest、元数据帧数、连续 frame index、严格递增的墙钟/单调时间、有限状态/动作值及可解码且同路同尺寸的图像。未显式传入 `--camera` 时只选择所有 episode 共有的相机；共有集合为空会失败，不会静默生成 state-only 数据集。随后以服务端单调时间按 episode 声明的固定 FPS 使用整数时间网格做最近邻重采样，只生成不晚于原 episode 末端的目标时间；状态采样间隙或超过默认 100 ms 图像匹配窗口都会令导出失败。导出完成后会重新加载数据集，核对 episode/frame/FPS/features，并要求 `meta/stats.json` 存在且统计值全部有限。当前环境若不安装 LeRobot，可用 `--lerobot-source .\tmp\lerobot-source` 指向已审计的 v0.4.2 源码，但其 Python 依赖仍需安装。
+
+## 测试
+
+```powershell
+python -m pytest .\teleop\bridge\tests
+```
+
+测试只使用 `SimulatorBackend` 和本地临时目录，不连接真机。
+
+当前交付尚未完成 LM3-UP 真机停机距离/时延测试、Python 3.11 环境测试，以及官方 LeRobot v0.4.2 + FFmpeg 在 Windows 上的完整导出/回读端到端验证；这些项目通过前不得宣称真机或训练数据流水线已经验收。
