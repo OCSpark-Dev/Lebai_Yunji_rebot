@@ -7,7 +7,12 @@
 - 连接后必须收到 `session.welcome`、20 Hz 命令率、有效服务端看门狗和 `robot.state`，才允许申请控制权。
 - 客户端按本地单调时钟记录最后一帧 `robot.state`；超过 1000 ms 未更新就禁止申请控制和执行动作，运动中会立即 `motion.stop` 并释放租约。
 - 操作者必须逐项确认底盘停止、工作区清空、急停可触达、工具固定，然后持续按住 1.5 秒申请 2 秒租约。
-- 笛卡尔运动采用“先选择单一轴向，再按住绿色 DEADMAN”的方式。只有按住期间才以 20 Hz 发送 `motion.cartesian_velocity`，每帧 `duration_ms=100`。
+- 手机姿态旋转遥操运行时必须先检测到硬件 `TYPE_GYROSCOPE`（或 `TYPE_GYROSCOPE_UNCALIBRATED`），再优先读取 Android `TYPE_GAME_ROTATION_VECTOR`（陀螺仪+加速度计融合），缺失时才回退 `TYPE_ROTATION_VECTOR`；没有陀螺仪的设备会禁用姿态模式。客户端不直接积分原始角速度，避免把积分漂移直接送给机械臂。`GAME_ROTATION_VECTOR` 不使用磁北，短时相对姿态平滑但 yaw 仍会随时间漂移，因此每次作业前必须显式归零。
+- IMU 只控制 TCP 的 `Rx/Ry/Rz`，绝不把手机姿态当成 XYZ 平移。XYZ 仍由触屏单轴低速控制；这不是 ARCore 6DoF 位置跟踪。
+- 归零约定为手机屏幕朝上、顶部指向机器人基坐标 `+X`。按 Android 设备轴右手正方向：绕顶部 `+Y` 映射 TCP `+Rx`，绕屏幕右侧 `+X` 映射 TCP `-Ry`，绕屏幕朝外 `+Z` 映射 TCP `+Rz`。该约定仍需在固定底盘、最低速度和空载状态下逐轴验向。
+- 姿态 DEADMAN 按住期间最多以 20 Hz 发送 `pose.sample`。每次按住的首帧只做 priming；后续发送相邻成功发送姿态的最短旋转增量。低于 `0.8` 的置信度、非有限值、时间戳倒退、超过 250 ms 的采样间隔、超过 150 ms 的样本年龄、相对零位超过 30°、单次已发送增量超过 12°或传感器跳变都会失败关闭并要求重新归零。
+- 已发送 `pose.sample` 的待确认序号会保留到对应 ACK/error 或会话关闭；即使操作者已经松开姿态 DEADMAN，延迟到达的拒绝仍会撤销租约并清除归零。待确认姿态命令超过 32 条时主动 `motion.stop`，不会静默丢弃旧序号。
+- 触屏笛卡尔运动采用“先选择单一轴向，再按住绿色 DEADMAN”的方式。只有按住期间才以 20 Hz 发送 `motion.cartesian_velocity`，每帧 `duration_ms=100`。
 - DEADMAN 松手、触摸取消、租约到期、安全项撤销、底盘未锁定、看门狗异常、急停/故障、服务端拒绝、App 进入后台和主动断开都会立即发送 `motion.stop`。
 - App 进入后台还会停止录制并释放控制租约；回到前台必须重新完成长按解锁。
 - 网络已经断开时无法再发送停机帧，客户端会清空本地控制状态，服务端必须依靠约 300 ms 的独立看门狗失败关闭。
@@ -54,6 +59,7 @@
 - `control.acquire` / `control.release`
 - `heartbeat`
 - `motion.cartesian_velocity` / `motion.stop`
+- `pose.sample`（`phone_calibrated` / `tcp_orientation`，仅旋转 3DoF）
 - `gripper.set`
 - `recording.start` / `recording.stop`
 
@@ -67,7 +73,7 @@
 - `recording.status`
 - `ack` / `error` / `safety.event`
 
-客户端保留 `pose.sample` capability 的协议空间，但首版不会声明或发送它。
+`pose.sample.angular_delta_rad` 使用归零手机坐标中的相邻已发送姿态左差：`q_rel = inverse(q_zero) * q_current`，`q_delta = q_rel_current * inverse(q_rel_previous)`，再规范为最短旋转矢量并按 `[phone_y, -phone_x, phone_z] -> [tcp_rx, tcp_ry, tcp_rz]` 映射。`sensor_timestamp_ms` 来自设备单调时钟，而非 Unix 时间。
 
 ## 构建
 
@@ -92,6 +98,8 @@ app/build/outputs/apk/debug/app-debug.apk
 - `network/TeleopWebSocket.kt`：OkHttp WebSocket 连接与协议解码。
 - `control/TeleopController.kt`：租约、安全门、20 Hz DEADMAN、心跳和失败关闭。
 - `core/`：纯 Kotlin 的轴向、速度、安全门和网络策略，支持 JVM 单元测试。
+- `core/OrientationTeleop.kt`：四元数归零、轴映射、姿态/时间戳/置信度门和相邻已发送增量。
+- `sensor/PhoneOrientationSensor.kt`：Android 融合旋转矢量传感器选择与读取。
 - `MainActivity.kt`：传统 Android View UI，不依赖 Flutter 或 Compose。
 
 ## 验证边界

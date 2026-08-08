@@ -24,7 +24,10 @@ class ProtocolCodecTest {
         assertEquals(TELEOP_PROTOCOL, json.getString("protocol"))
         assertEquals(1234L, json.getLong("sent_at_ms"))
         assertEquals("android", json.getJSONObject("body").getString("platform"))
-        assertEquals(3, json.getJSONObject("body").getJSONArray("capabilities").length())
+        assertEquals(4, json.getJSONObject("body").getJSONArray("capabilities").length())
+        assertTrue(
+            json.getJSONObject("body").getJSONArray("capabilities").toString().contains("pose_sample"),
+        )
     }
 
     @Test
@@ -32,6 +35,24 @@ class ProtocolCodecTest {
         val body = ProtocolBodies.motionStop(null, "app_background")
         assertFalse(body.has("lease_id"))
         assertEquals("app_background", body.getString("reason"))
+    }
+
+    @Test
+    fun poseSampleUsesCalibratedPhoneFrameAndMonotonicMilliseconds() {
+        val body = ProtocolBodies.poseSample(
+            leaseId = "lease-1",
+            calibrationId = "calibration-1",
+            sensorTimestampMs = 1_234L,
+            confidence = 0.8,
+            angularDeltaRad = Vector3(x = 0.01, y = -0.02, z = 0.03),
+        )
+
+        assertEquals("phone_calibrated", body.getString("frame"))
+        assertEquals("tcp_orientation", body.getString("mapping"))
+        assertTrue(body.getBoolean("deadman"))
+        assertEquals("tracking", body.getString("tracking_state"))
+        assertEquals(1_234L, body.getLong("sensor_timestamp_ms"))
+        assertEquals(-0.02, body.getJSONObject("angular_delta_rad").getDouble("ry"), 0.0)
     }
 
     @Test

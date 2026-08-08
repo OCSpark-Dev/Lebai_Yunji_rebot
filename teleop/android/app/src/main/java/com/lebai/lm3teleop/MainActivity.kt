@@ -7,6 +7,7 @@ import android.annotation.SuppressLint
 import android.app.Activity
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
@@ -14,18 +15,25 @@ import android.widget.Button
 import android.widget.SeekBar
 import android.widget.Toast
 import com.lebai.lm3teleop.control.ControllerSnapshot
+import com.lebai.lm3teleop.control.MotionInput
 import com.lebai.lm3teleop.control.TeleopController
 import com.lebai.lm3teleop.core.AxisDirection
+import com.lebai.lm3teleop.core.CalibratedOrientation
+import com.lebai.lm3teleop.core.CalibrationResult
 import com.lebai.lm3teleop.core.DeadmanTouchDecision
 import com.lebai.lm3teleop.core.DeadmanTouchTracker
 import com.lebai.lm3teleop.core.LifecycleSafetyPolicy
 import com.lebai.lm3teleop.core.NetworkPolicy
+import com.lebai.lm3teleop.core.OrientationResult
+import com.lebai.lm3teleop.core.OrientationSafetyMapper
+import com.lebai.lm3teleop.core.OrientationSensorSample
 import com.lebai.lm3teleop.core.SafetyChecklist
 import com.lebai.lm3teleop.core.SpeedGear
 import com.lebai.lm3teleop.databinding.ActivityMainBinding
 import com.lebai.lm3teleop.network.TransportState
 import com.lebai.lm3teleop.protocol.CAMERA_TOP
 import com.lebai.lm3teleop.protocol.CAMERA_WRIST
+import com.lebai.lm3teleop.sensor.PhoneOrientationSensor
 import java.util.Locale
 import java.util.UUID
 
@@ -41,6 +49,15 @@ class MainActivity : Activity() {
     private var syncingChecklistUi = false
     private lateinit var axisButtons: Map<Button, AxisDirection>
     private val deadmanTouchTracker = DeadmanTouchTracker()
+    private val gyroDeadmanTouchTracker = DeadmanTouchTracker()
+    private val orientationMapper = OrientationSafetyMapper()
+    private lateinit var orientationSensor: PhoneOrientationSensor
+    private var latestOrientation: CalibratedOrientation? = null
+    private var orientationCalibrationId: String? = null
+    private var gyroHolding = false
+    private var orientationStatus = "等待姿态传感器"
+    private var lastOrientationUiUpdateNs = 0L
+    private var previousSessionReady = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -63,10 +80,16 @@ class MainActivity : Activity() {
             appVersion = BuildConfig.VERSION_NAME,
             listener = { snapshot -> runOnUiThread { render(snapshot) } },
         )
+        orientationSensor = PhoneOrientationSensor(
+            context = this,
+            onSample = ::onOrientationSample,
+            onFault = ::onOrientationSensorFault,
+        )
 
         setupConnection(preferences)
         setupChecklist()
         setupUnlockHold()
+        setupOrientationControls()
         setupMotionControls()
         setupGripper()
         setupRecording()
@@ -75,12 +98,24 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        if (::orientationSensor.isInitialized) {
+            orientationStatus = if (orientationSensor.start()) {
+                "传感器已启动：${orientationSensor.description}"
+            } else {
+                orientationSensor.description
+            }
+            renderOrientationState(force = true)
+        }
         if (::controller.isInitialized) controller.onAppForeground()
     }
 
     override fun onPause() {
         cancelUnlockHold()
         deadmanTouchTracker.reset()
+        gyroDeadmanTouchTracker.reset()
+        gyroHolding = false
+        resetOrientationInput("App 已进入后台，姿态归零已清除")
+        if (::orientationSensor.isInitialized) orientationSensor.stop()
         if (::binding.isInitialized) binding.tokenInput.text?.clear()
         if (::controller.isInitialized) controller.onAppBackground()
         super.onPause()
@@ -89,6 +124,8 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         cancelUnlockHold()
         deadmanTouchTracker.reset()
+        gyroDeadmanTouchTracker.reset()
+        if (::orientationSensor.isInitialized) orientationSensor.stop()
         if (
             ::controller.isInitialized &&
             LifecycleSafetyPolicy.shouldDestroyController(isChangingConfigurations)
@@ -124,11 +161,13 @@ class MainActivity : Activity() {
                 .apply()
             binding.transportWarning.text = validation.warning
                 ?: "WSS 已启用；仍应在隔离控制网中部署并校验证书。"
+            resetOrientationInput("正在建立新会话；连接后请重新归零")
             controller.connect(validation.normalizedUrl!!, clientName, token)
             binding.tokenInput.text?.clear()
         }
 
         binding.disconnectButton.setOnClickListener {
+            resetOrientationInput("连接已断开，姿态归零已清除")
             controller.disconnect("operator_disconnect")
         }
     }
@@ -188,7 +227,211 @@ class MainActivity : Activity() {
             }
         }
         binding.releaseButton.setOnClickListener {
+            gyroHolding = false
+            gyroDeadmanTouchTracker.reset()
+            resetOrientationInput("控制权已释放，请重新归零")
             controller.releaseControl("operator_release")
+        }
+    }
+
+    @SuppressLint("ClickableViewAccessibility")
+    private fun setupOrientationControls() {
+        binding.gyroZeroButton.setOnClickListener {
+            if (lastSnapshot.deadmanActive) {
+                showMessage("运动期间不能重新归零")
+                return@setOnClickListener
+            }
+            when (val result = orientationMapper.calibrate(SystemClock.elapsedRealtimeNanos())) {
+                is CalibrationResult.Success -> {
+                    latestOrientation = result.value
+                    orientationCalibrationId = UUID.randomUUID().toString()
+                    orientationStatus = "已归零；按住姿态 DEADMAN 后首帧仅用于 priming"
+                }
+
+                is CalibrationResult.Failure -> {
+                    resetOrientationInput("归零失败：${result.code.reason}")
+                    showMessage(orientationStatus)
+                }
+            }
+            renderOrientationState(force = true)
+        }
+
+        binding.gyroDeadmanButton.setOnClickListener {
+            // Accessibility hook; motion requires a continuous touch hold.
+        }
+        binding.gyroDeadmanButton.setOnTouchListener { view, event ->
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    if (!view.isEnabled) return@setOnTouchListener false
+                    val tracking = orientationMapper.current(SystemClock.elapsedRealtimeNanos())
+                    val calibrationId = orientationCalibrationId
+                    if (tracking !is OrientationResult.Tracking || calibrationId.isNullOrBlank()) {
+                        resetOrientationInput("姿态样本未归零或已过期")
+                        showMessage(orientationStatus)
+                        return@setOnTouchListener true
+                    }
+                    gyroDeadmanTouchTracker.onDown(event.getPointerId(event.actionIndex))
+                    gyroHolding = true
+                    val started = controller.startPoseMotion(calibrationId, tracking.value)
+                    if (!started) {
+                        gyroHolding = false
+                        gyroDeadmanTouchTracker.reset()
+                        showMessage("姿态动作未发送：${lastSnapshot.gateReason}")
+                    }
+                    renderOrientationState(force = true)
+                    true
+                }
+
+                MotionEvent.ACTION_MOVE -> {
+                    val pointerIndex = event.findPointerIndex(gyroDeadmanTouchTracker.activePointerId)
+                    val activePointerPresent = pointerIndex >= 0
+                    val insideBounds = activePointerPresent &&
+                        event.getX(pointerIndex) >= 0f &&
+                        event.getX(pointerIndex) < view.width.toFloat() &&
+                        event.getY(pointerIndex) >= 0f &&
+                        event.getY(pointerIndex) < view.height.toFloat()
+                    if (
+                        gyroDeadmanTouchTracker.onMove(activePointerPresent, insideBounds) ==
+                        DeadmanTouchDecision.STOP
+                    ) {
+                        stopOrientationMotion(
+                            if (activePointerPresent) {
+                                "orientation_deadman_outside_bounds"
+                            } else {
+                                "orientation_deadman_pointer_lost"
+                            },
+                            clearCalibration = true,
+                        )
+                    }
+                    true
+                }
+
+                MotionEvent.ACTION_POINTER_UP -> {
+                    if (
+                        gyroDeadmanTouchTracker.onPointerUp(event.getPointerId(event.actionIndex)) ==
+                        DeadmanTouchDecision.STOP
+                    ) {
+                        stopOrientationMotion("orientation_deadman_active_pointer_released")
+                    }
+                    true
+                }
+
+                MotionEvent.ACTION_UP -> {
+                    if (gyroDeadmanTouchTracker.onTerminal() == DeadmanTouchDecision.STOP) {
+                        stopOrientationMotion("orientation_deadman_released")
+                    }
+                    view.performClick()
+                    true
+                }
+
+                MotionEvent.ACTION_CANCEL, MotionEvent.ACTION_OUTSIDE -> {
+                    if (gyroDeadmanTouchTracker.onTerminal() == DeadmanTouchDecision.STOP) {
+                        stopOrientationMotion("orientation_deadman_cancelled", clearCalibration = true)
+                    }
+                    true
+                }
+
+                else -> true
+            }
+        }
+        renderOrientationState(force = true)
+    }
+
+    private fun onOrientationSample(sample: OrientationSensorSample) {
+        when (val result = orientationMapper.ingest(sample)) {
+            is OrientationResult.AwaitingCalibration -> {
+                latestOrientation = null
+                orientationStatus = "传感器跟踪正常；请保持手机稳定并点击归零"
+            }
+
+            is OrientationResult.Tracking -> {
+                latestOrientation = result.value
+                orientationStatus = if (gyroHolding) {
+                    "姿态 DEADMAN 生效；仅发送 TCP 旋转增量"
+                } else {
+                    "姿态已归零；等待按住 DEADMAN"
+                }
+                val calibrationId = orientationCalibrationId
+                if (
+                    gyroHolding &&
+                    (calibrationId.isNullOrBlank() || !controller.updatePoseMotion(calibrationId, result.value))
+                ) {
+                    gyroHolding = false
+                    gyroDeadmanTouchTracker.reset()
+                    resetOrientationInput("姿态控制器已失败关闭，请重新归零和解锁")
+                }
+            }
+
+            is OrientationResult.Fault -> {
+                failClosedOrientation(result.code.reason, "orientation_${result.code.name.lowercase()}")
+            }
+        }
+        renderOrientationState()
+    }
+
+    private fun onOrientationSensorFault(reason: String) {
+        failClosedOrientation(reason, "orientation_sensor_fault")
+    }
+
+    private fun failClosedOrientation(message: String, stopReason: String) {
+        val wasHolding = gyroHolding
+        gyroHolding = false
+        gyroDeadmanTouchTracker.reset()
+        resetOrientationInput("姿态输入失败关闭：$message")
+        if (wasHolding) {
+            controller.releaseControl(stopReason)
+        }
+        renderOrientationState(force = true)
+    }
+
+    private fun stopOrientationMotion(reason: String, clearCalibration: Boolean = false) {
+        val wasHolding = gyroHolding
+        gyroHolding = false
+        gyroDeadmanTouchTracker.reset()
+        if (wasHolding) controller.stopMotion(reason)
+        if (clearCalibration) resetOrientationInput("姿态触摸被取消，请重新归零")
+        renderOrientationState(force = true)
+    }
+
+    private fun resetOrientationInput(status: String) {
+        orientationMapper.reset()
+        latestOrientation = null
+        orientationCalibrationId = null
+        orientationStatus = status
+    }
+
+    private fun renderOrientationState(force: Boolean = false) {
+        if (!::binding.isInitialized || !::orientationSensor.isInitialized) return
+        val nowNs = SystemClock.elapsedRealtimeNanos()
+        if (!force && nowNs - lastOrientationUiUpdateNs < ORIENTATION_UI_PERIOD_NS) return
+        lastOrientationUiUpdateNs = nowNs
+        val tracking = latestOrientation
+        binding.gyroSensorText.text = "${orientationSensor.description}\n$orientationStatus"
+        binding.gyroRelativeText.text = if (tracking == null) {
+            "相对姿态: Rx —  Ry —  Rz —"
+        } else {
+            String.format(
+                Locale.US,
+                "相对姿态: Rx %+.1f°  Ry %+.1f°  Rz %+.1f°  置信度 %.2f",
+                Math.toDegrees(tracking.relativeRotationRad.x),
+                Math.toDegrees(tracking.relativeRotationRad.y),
+                Math.toDegrees(tracking.relativeRotationRad.z),
+                tracking.confidence,
+            )
+        }
+        val freshSample = orientationMapper.canCalibrate(nowNs)
+        val sessionReady = lastSnapshot.transportState == TransportState.OPEN && lastSnapshot.welcomeReceived
+        binding.gyroZeroButton.isEnabled = orientationSensor.available &&
+            sessionReady &&
+            freshSample &&
+            !lastSnapshot.deadmanActive
+        val canStart = lastSnapshot.canAct && orientationMapper.calibrated && freshSample
+        binding.gyroDeadmanButton.isEnabled = gyroHolding || (canStart && !lastSnapshot.deadmanActive)
+        binding.gyroDeadmanButton.alpha = if (binding.gyroDeadmanButton.isEnabled) 1.0f else 0.45f
+        binding.gyroDeadmanButton.text = if (gyroHolding) {
+            "保持按住：手机姿态 → TCP Rx/Ry/Rz"
+        } else {
+            "归零后按住姿态 DEADMAN"
         }
     }
 
@@ -289,7 +532,11 @@ class MainActivity : Activity() {
         }
         binding.deadmanButton.setOnClickListener { /* Accessibility hook; movement requires touch hold. */ }
         binding.stopButton.setOnClickListener {
+            gyroHolding = false
+            gyroDeadmanTouchTracker.reset()
+            resetOrientationInput("已立即停止，姿态归零已清除")
             controller.emergencyStop("operator_stop_button")
+            renderOrientationState(force = true)
         }
         renderMotionSelection()
     }
@@ -372,6 +619,28 @@ class MainActivity : Activity() {
     }
 
     private fun render(snapshot: ControllerSnapshot) {
+        val sessionReady = snapshot.transportState == TransportState.OPEN && snapshot.welcomeReceived
+        val poseLeaseWasLost = orientationCalibrationId != null &&
+            lastSnapshot.leaseId != null &&
+            snapshot.leaseId == null
+        if (previousSessionReady && !sessionReady) {
+            gyroHolding = false
+            gyroDeadmanTouchTracker.reset()
+            resetOrientationInput("会话已关闭，姿态归零已清除")
+        } else if (poseLeaseWasLost) {
+            gyroHolding = false
+            gyroDeadmanTouchTracker.reset()
+            resetOrientationInput("控制租约已结束，姿态归零已清除")
+        }
+        previousSessionReady = sessionReady
+        if (
+            gyroHolding &&
+            (!snapshot.deadmanActive || snapshot.motionInput != MotionInput.PHONE_ORIENTATION)
+        ) {
+            gyroHolding = false
+            gyroDeadmanTouchTracker.reset()
+            resetOrientationInput("姿态运动被安全停止，请重新归零")
+        }
         lastSnapshot = snapshot
         syncingChecklistUi = true
         try {
@@ -400,8 +669,10 @@ class MainActivity : Activity() {
             else -> "按住 1.5 秒申请控制权"
         }
         binding.releaseButton.isEnabled = snapshot.leaseId != null
-        binding.deadmanButton.isEnabled = snapshot.canAct
-        binding.deadmanButton.alpha = if (snapshot.canAct) 1.0f else 0.45f
+        val touchMotionEnabled = snapshot.canAct && !gyroHolding &&
+            snapshot.motionInput != MotionInput.PHONE_ORIENTATION
+        binding.deadmanButton.isEnabled = touchMotionEnabled
+        binding.deadmanButton.alpha = if (touchMotionEnabled) 1.0f else 0.45f
         binding.deadmanButton.text = if (snapshot.deadmanActive) {
             "保持按住：${selectedAxis.displayName}"
         } else {
@@ -437,6 +708,7 @@ class MainActivity : Activity() {
                 },
             ),
         )
+        renderOrientationState(force = true)
     }
 
     private fun buildStatusText(snapshot: ControllerSnapshot): String = buildString {
@@ -458,6 +730,14 @@ class MainActivity : Activity() {
                 ),
             )
         }
+        append('\n')
+        append(
+            "输入: " + when (snapshot.motionInput) {
+                MotionInput.TOUCH_AXIS -> "触屏轴向"
+                MotionInput.PHONE_ORIENTATION -> "手机姿态（仅 TCP 旋转）"
+                null -> "无"
+            },
+        )
         append('\n')
         append("夹爪反馈: ${snapshot.gripperPct?.let { String.format(Locale.US, "%.1f%%", it) } ?: "未知"}\n")
         append("录制: ${if (snapshot.recordingActive) "进行中" else if (snapshot.recordingPending) "等待确认" else "未录制"}")
@@ -488,5 +768,6 @@ class MainActivity : Activity() {
         private const val KEY_ENDPOINT = "endpoint"
         private const val KEY_CLIENT_NAME = "client_name"
         private const val UNLOCK_HOLD_MS = 1_500L
+        private const val ORIENTATION_UI_PERIOD_NS = 50_000_000L
     }
 }

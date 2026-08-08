@@ -18,8 +18,23 @@ import {
   HelloBody,
   MAX_WATCHDOG_MS,
   OPERATOR_HOLD_MS,
+  POSE_MAX_COMMAND_DELTA_RAD,
+  POSE_MAX_INPUT_ANGULAR_RPS,
+  POSE_MAX_RELATIVE_ANGLE_RAD,
+  POSE_MAX_SAMPLE_GAP_MS,
+  POSE_MAX_SENT_INTERVAL_MS,
+  POSE_MAX_SENSOR_JUMP_RAD,
+  POSE_MIN_SENT_INTERVAL_MS,
+  POSE_MIN_ACCURACY,
+  POSE_SAMPLE_PERIOD_MS,
+  POSE_SENSOR_STALE_MS,
+  POSE_TCP_RX_FROM_PHONE_Y_SIGN,
+  POSE_TCP_RY_FROM_PHONE_X_SIGN,
+  POSE_TCP_RZ_FROM_PHONE_Z_SIGN,
   Pose6,
+  PoseSampleBody,
   ProtocolEnvelope,
+  Quaternion4,
   REQUESTED_LEASE_MS,
   RecordingStartBody,
   RecordingStatusBody,
@@ -41,6 +56,7 @@ import {
   validateSafetyEventBody,
   validateWelcomeBody
 } from '../model/TeleopProtocol';
+import { PhonePoseReading, PhonePoseSensor } from './PhonePoseSensor';
 
 export class TeleopSnapshot {
   connected: boolean = false;
@@ -71,6 +87,18 @@ export class TeleopSnapshot {
   recording: boolean = false;
   episodeId: string = '-';
   deadmanHeld: boolean = false;
+  poseSensorActive: boolean = false;
+  poseSensorStatus: string = '姿态传感器未启用';
+  poseTracking: boolean = false;
+  poseAccuracy: number = 0;
+  poseConfidence: number = 0;
+  poseSampleAgeMs: number = -1;
+  poseCalibrated: boolean = false;
+  poseCalibrationIdDisplay: string = '-';
+  poseDeadmanHeld: boolean = false;
+  poseDeltaText: string = '-';
+  canCalibratePose: boolean = false;
+  canPoseCommand: boolean = false;
   baseStationary: boolean = false;
   workspaceClear: boolean = false;
   estopAccessible: boolean = false;
@@ -128,6 +156,24 @@ export class TeleopClient {
   private episodeId: string = '-';
   private deadmanHeld: boolean = false;
   private deadmanTouchId: number = -1;
+  private poseSensor: PhonePoseSensor = new PhonePoseSensor();
+  private poseSensorActive: boolean = false;
+  private poseTracking: boolean = false;
+  private poseAccuracy: number = 0;
+  private poseConfidence: number = 0;
+  private poseLastSensorTimestampMs: number = 0;
+  private poseLastSentSensorTimestampMs: number = 0;
+  private poseLatestQuaternion: Quaternion4 | undefined = undefined;
+  private posePreviousRawQuaternion: Quaternion4 | undefined = undefined;
+  private poseCalibrationQuaternion: Quaternion4 | undefined = undefined;
+  private posePreviousSentRelative: Quaternion4 | undefined = undefined;
+  private poseCalibrationId: string = '';
+  private poseDeadmanHeld: boolean = false;
+  private poseDeadmanTouchId: number = -1;
+  private posePrimePending: boolean = false;
+  private poseLastDelta: Angular3 = new Angular3();
+  private poseSensorStatus: string = '姿态传感器未启用';
+  private pendingPoseAckSeqs: Array<number> = [];
   private activeAxis: string = AxisName.NONE;
   private axisDirection: number = 0;
   private axisTouchId: number = -1;
@@ -242,7 +288,7 @@ export class TeleopClient {
     if (index < 0 || index >= this.speedProfiles.length) {
       return;
     }
-    if (this.deadmanHeld || this.activeAxis !== AxisName.NONE) {
+    if (this.deadmanHeld || this.poseDeadmanHeld || this.activeAxis !== AxisName.NONE) {
       this.failClosed('speed_changed_during_motion', false);
     }
     this.speedIndex = index;
@@ -267,6 +313,11 @@ export class TeleopClient {
       this.emitSnapshot();
       return;
     }
+    if (this.poseDeadmanHeld) {
+      this.lastEvent = '触屏 DEADMAN 被拒绝：手机姿态 DEADMAN 正在使用控制权';
+      this.emitSnapshot();
+      return;
+    }
     if (touchId < 0 || (this.deadmanTouchId >= 0 && touchId !== this.deadmanTouchId)) {
       this.lastEvent = 'deadman 已由另一个触点持有';
       this.emitSnapshot();
@@ -285,7 +336,123 @@ export class TeleopClient {
     this.emitSnapshot();
   }
 
+  startPoseSensor(): void {
+    if (!this.foreground) {
+      this.lastEvent = '姿态传感器启动被拒绝：应用不在前台';
+      this.emitSnapshot();
+      return;
+    }
+    if (this.poseSensorActive) {
+      this.lastEvent = '手机姿态传感器已经启用';
+      this.emitSnapshot();
+      return;
+    }
+    this.poseSensorStatus = '正在检查硬件陀螺仪并订阅 ROTATION_VECTOR';
+    const started = this.poseSensor.start(
+      (reading: PhonePoseReading) => {
+        this.handlePoseReading(reading);
+      },
+      (reason: string) => {
+        this.handlePoseSensorFailure(reason);
+      }
+    );
+    this.poseSensorActive = started;
+    if (started) {
+      this.poseSensorStatus = '硬件陀螺仪已确认；ROTATION_VECTOR 已订阅，等待稳定数据';
+      this.lastEvent = '陀螺仪姿态传感器已启用；归零前不会发送运动';
+      this.emitSnapshot();
+    }
+  }
+
+  stopPoseSensor(reason: string = 'operator_pose_sensor_stop'): void {
+    if (this.poseDeadmanHeld) {
+      this.sendStop(reason);
+    }
+    this.stopPoseSensorInternal(true);
+    this.lastEvent = '手机姿态传感器已停止；必须重新启用并归零';
+    this.emitSnapshot();
+  }
+
+  calibratePose(): void {
+    if (!this.canCalibratePose()) {
+      this.lastEvent = '姿态归零被拒绝：需要有效租约、稳定且新鲜的旋转矢量数据';
+      this.emitSnapshot();
+      return;
+    }
+    const latest = this.poseLatestQuaternion;
+    const nowUptimeMs = this.monotonicNowMs();
+    if (latest === undefined || nowUptimeMs < 0) {
+      this.lastEvent = '姿态归零失败：没有可用四元数或单调时钟';
+      this.emitSnapshot();
+      return;
+    }
+    this.poseCalibrationQuaternion = this.copyQuaternion(latest);
+    this.posePreviousSentRelative = undefined;
+    this.poseLastSentSensorTimestampMs = 0;
+    this.posePrimePending = true;
+    this.poseLastDelta = new Angular3();
+    this.poseCalibrationId = `harmony-pose-${Date.now()}-${Math.round(nowUptimeMs)}`;
+    this.lastEvent = '手机姿态已归零；轴向仍须先在仿真中验向';
+    this.emitSnapshot();
+  }
+
+  setPoseDeadman(held: boolean, touchId: number): void {
+    if (!held) {
+      if (touchId >= 0 && this.poseDeadmanTouchId >= 0 && touchId !== this.poseDeadmanTouchId) {
+        return;
+      }
+      if (this.poseDeadmanHeld) {
+        this.sendStop('pose_deadman_released');
+      }
+      this.poseDeadmanHeld = false;
+      this.poseDeadmanTouchId = -1;
+      this.posePreviousSentRelative = undefined;
+      this.poseLastSentSensorTimestampMs = 0;
+      this.posePrimePending = true;
+      this.poseLastDelta = new Angular3();
+      this.lastEvent = '姿态 DEADMAN 已松开，已发送 stop';
+      this.emitSnapshot();
+      return;
+    }
+    if (this.deadmanHeld || this.activeAxis !== AxisName.NONE) {
+      this.lastEvent = '姿态 DEADMAN 被拒绝：触屏点动正在占用控制权';
+      this.emitSnapshot();
+      return;
+    }
+    if (touchId < 0 || (this.poseDeadmanTouchId >= 0 && touchId !== this.poseDeadmanTouchId)) {
+      this.lastEvent = '姿态 DEADMAN 已由另一个触点持有';
+      this.emitSnapshot();
+      return;
+    }
+    if (!this.canSendPoseSample()) {
+      this.poseDeadmanHeld = false;
+      this.poseDeadmanTouchId = -1;
+      this.lastEvent = '无法按下姿态 DEADMAN：请先取得租约、启用传感器并归零';
+      this.emitSnapshot();
+      return;
+    }
+    const relative = this.currentRelativeQuaternion();
+    if (relative === undefined) {
+      this.lastEvent = '无法按下姿态 DEADMAN：相对四元数无效';
+      this.emitSnapshot();
+      return;
+    }
+    this.poseDeadmanHeld = true;
+    this.poseDeadmanTouchId = touchId;
+    this.posePreviousSentRelative = this.copyQuaternion(relative);
+    this.poseLastSentSensorTimestampMs = 0;
+    this.posePrimePending = true;
+    this.poseLastDelta = new Angular3();
+    this.lastEvent = '姿态 DEADMAN 按住；首帧只做 priming，随后 20 Hz 发送旋转增量';
+    this.emitSnapshot();
+  }
+
   pressAxis(axis: string, direction: number, touchId: number): void {
+    if (this.poseDeadmanHeld) {
+      this.lastEvent = '轴向命令被拒绝：手机姿态 DEADMAN 正在使用控制权';
+      this.emitSnapshot();
+      return;
+    }
     if (!this.deadmanHeld || !this.hasSafeLease(false)) {
       this.lastEvent = '轴向命令被拒绝：必须先按住 deadman';
       this.emitSnapshot();
@@ -327,7 +494,7 @@ export class TeleopClient {
   }
 
   setGripper(positionPct: number): void {
-    if (!this.deadmanHeld || this.activeAxis !== AxisName.NONE || !this.hasSafeLease(false)) {
+    if (!this.deadmanHeld || this.poseDeadmanHeld || this.activeAxis !== AxisName.NONE || !this.hasSafeLease(false)) {
       this.lastEvent = '夹爪命令被拒绝：必须按住 deadman 且租约有效';
       this.emitSnapshot();
       return;
@@ -339,7 +506,7 @@ export class TeleopClient {
   }
 
   startRecording(task: string, episodeId: string, cameras: Array<string>): void {
-    const allowMoving = this.deadmanHeld && this.activeAxis !== AxisName.NONE;
+    const allowMoving = this.isAnyMotionActive();
     if (!this.hasSafeLease(allowMoving)) {
       this.lastEvent = '录制开始被拒绝：需要有效控制租约和安全状态';
       this.emitSnapshot();
@@ -497,9 +664,13 @@ export class TeleopClient {
         return;
       }
       const ackType = body.ack_type;
+      if (ackType === 'pose.sample') {
+        this.removePendingPoseAck(body.ack_seq);
+      }
       const detail = body.detail ? `：${body.detail}` : '';
       this.lastEvent = `${body.accepted ? 'ACK' : '拒绝'} ${ackType}${body.clamped ? '（服务端已限幅）' : ''}${detail}`;
-      if (!body.accepted && (ackType.startsWith('motion.') || ackType === 'gripper.set')) {
+      if (!body.accepted &&
+        (ackType.startsWith('motion.') || ackType === 'gripper.set' || ackType === 'pose.sample')) {
         this.failClosed('command_rejected', true);
       } else {
         this.emitSnapshot();
@@ -511,7 +682,10 @@ export class TeleopClient {
         return;
       }
       const errorText = `server_error:${body.code}:${body.message}`;
-      if (body.recoverable) {
+      const poseCommandError = body.ack_seq !== undefined && this.removePendingPoseAck(body.ack_seq);
+      if (poseCommandError || this.poseDeadmanHeld) {
+        this.failClosed(`pose_server_error:${body.code}`, true);
+      } else if (body.recoverable) {
         this.lastEvent = errorText;
         this.emitSnapshot();
       } else {
@@ -564,7 +738,7 @@ export class TeleopClient {
       this.leaseId = body.lease_id;
       this.leaseExpiresAtMs = body.expires_at_ms;
       this.leaseDeadlineUptimeMs = nowUptimeMs + Math.min(REQUESTED_LEASE_MS, serverRemainingMs);
-      const allowMoving = this.deadmanHeld && this.activeAxis !== AxisName.NONE;
+      const allowMoving = this.isAnyMotionActive();
       if (!this.hasSafeLease(allowMoving)) {
         this.failClosed('control_granted_while_gate_closed', true);
         return;
@@ -599,7 +773,7 @@ export class TeleopClient {
     this.lastRobotStateAtMs = Date.now();
     this.lastRobotStateUptimeMs = nowUptimeMs;
 
-    const allowMoving = this.deadmanHeld && this.activeAxis !== AxisName.NONE;
+    const allowMoving = this.isAnyMotionActive();
     if (this.leaseId.length > 0 &&
       (!this.baseSafetyReady() || !this.isLeaseRobotModeSafe(allowMoving))) {
       this.failClosed('robot_state_became_unsafe', true);
@@ -638,13 +812,18 @@ export class TeleopClient {
       this.closeSocket('monotonic_clock_unavailable', true);
       return;
     }
-    const moving = this.deadmanHeld && this.activeAxis !== AxisName.NONE;
+    const axisMoving = this.deadmanHeld && this.activeAxis !== AxisName.NONE;
+    const poseMoving = this.poseDeadmanHeld;
+    const moving = axisMoving || poseMoving;
     if (this.leaseId.length > 0 && !this.hasSafeLease(moving)) {
       this.failClosed('lease_or_state_expired', true);
       return;
     }
 
-    if (moving && this.hasSafeLease(true) &&
+    if (poseMoving && this.hasSafeLease(true) &&
+      nowUptimeMs - this.lastMotionSentAtUptimeMs >= POSE_SAMPLE_PERIOD_MS) {
+      this.sendPoseSample(nowUptimeMs);
+    } else if (axisMoving && this.hasSafeLease(true) &&
       nowUptimeMs - this.lastMotionSentAtUptimeMs >= COMMAND_PERIOD_MS) {
       const linear = new Vector3();
       const angular = new Angular3();
@@ -672,6 +851,348 @@ export class TeleopClient {
     if (nowUptimeMs - this.lastUiEmitAtUptimeMs >= 250) {
       this.emitSnapshot();
     }
+  }
+
+  private handlePoseReading(reading: PhonePoseReading): void {
+    const nowUptimeMs = this.monotonicNowMs();
+    if (nowUptimeMs < 0) {
+      this.handlePoseSensorFailure('monotonic_clock_unavailable');
+      return;
+    }
+    const normalized = this.normalizeQuaternion(reading.x, reading.y, reading.z, reading.w);
+    if (normalized === undefined || !Number.isFinite(reading.accuracy) ||
+      !Number.isSafeInteger(reading.sensorTimestampMs) || reading.sensorTimestampMs <= 0) {
+      this.handlePoseSensorFailure('invalid_rotation_vector_sample');
+      return;
+    }
+    if (this.poseLastSensorTimestampMs > 0 && reading.sensorTimestampMs <= this.poseLastSensorTimestampMs) {
+      this.handlePoseSensorFailure('pose_sensor_timestamp_not_strictly_increasing');
+      return;
+    }
+    const callbackAgeMs = nowUptimeMs - reading.sensorTimestampMs;
+    if (callbackAgeMs < 0 || callbackAgeMs > POSE_SENSOR_STALE_MS) {
+      this.handlePoseSensorFailure('pose_sensor_timestamp_outside_uptime_window');
+      return;
+    }
+
+    const accuracy = Math.round(reading.accuracy);
+    if (accuracy < POSE_MIN_ACCURACY) {
+      this.poseAccuracy = accuracy;
+      this.poseConfidence = this.poseConfidenceForAccuracy(accuracy);
+      this.poseTracking = false;
+      this.poseLatestQuaternion = undefined;
+      this.posePreviousRawQuaternion = undefined;
+      this.poseLastSensorTimestampMs = reading.sensorTimestampMs;
+      this.clearPoseCalibration();
+      this.poseSensorStatus = `旋转矢量精度不足（${accuracy}/3），需要重新归零`;
+      if (this.poseDeadmanHeld) {
+        this.failClosed('pose_sensor_accuracy_lost', true);
+      } else {
+        this.lastEvent = this.poseSensorStatus;
+        this.emitSnapshotThrottled(nowUptimeMs);
+      }
+      return;
+    }
+
+    if (this.posePreviousRawQuaternion !== undefined && this.poseLastSensorTimestampMs > 0) {
+      const elapsedMs = reading.sensorTimestampMs - this.poseLastSensorTimestampMs;
+      if (elapsedMs > POSE_MAX_SAMPLE_GAP_MS) {
+        this.clearPoseCalibration();
+        if (this.poseDeadmanHeld) {
+          this.failClosed('pose_sensor_gap', true);
+          return;
+        }
+      } else {
+        const rawDelta = this.quaternionToRotationVector(
+          this.multiplyQuaternion(normalized, this.inverseQuaternion(this.posePreviousRawQuaternion))
+        );
+        if (this.angularMagnitude(rawDelta) > POSE_MAX_SENSOR_JUMP_RAD) {
+          this.poseTracking = false;
+          this.poseLatestQuaternion = undefined;
+          this.posePreviousRawQuaternion = undefined;
+          this.poseLastSensorTimestampMs = reading.sensorTimestampMs;
+          this.clearPoseCalibration();
+          this.poseSensorStatus = '检测到旋转矢量跳变，必须重新归零';
+          if (this.poseDeadmanHeld) {
+            this.failClosed('pose_sensor_jump', true);
+          } else {
+            this.lastEvent = this.poseSensorStatus;
+            this.emitSnapshot();
+          }
+          return;
+        }
+      }
+    }
+
+    this.poseLatestQuaternion = normalized;
+    this.posePreviousRawQuaternion = this.copyQuaternion(normalized);
+    this.poseLastSensorTimestampMs = reading.sensorTimestampMs;
+    this.poseAccuracy = accuracy;
+    this.poseConfidence = this.poseConfidenceForAccuracy(accuracy);
+    this.poseTracking = true;
+    this.poseSensorStatus = `硬件陀螺仪门禁通过；ROTATION_VECTOR 跟踪中（精度 ${accuracy}/3）`;
+    const relative = this.currentRelativeQuaternion();
+    if (relative !== undefined) {
+      const relativeMagnitude = this.angularMagnitude(this.quaternionToRotationVector(relative));
+      if (relativeMagnitude > POSE_MAX_RELATIVE_ANGLE_RAD) {
+        this.clearPoseCalibration();
+        this.poseSensorStatus = '手机偏离归零姿态超过 30 度，必须重新归零';
+        if (this.poseDeadmanHeld) {
+          this.failClosed('pose_relative_range_exceeded', true);
+        } else {
+          this.lastEvent = this.poseSensorStatus;
+          this.emitSnapshot();
+        }
+        return;
+      }
+    }
+    this.emitSnapshotThrottled(nowUptimeMs);
+  }
+
+  private handlePoseSensorFailure(reason: string): void {
+    const wasControlling = this.poseDeadmanHeld;
+    this.stopPoseSensorInternal(true);
+    this.poseSensorStatus = `姿态传感器失败关闭：${reason}`;
+    if (wasControlling) {
+      this.failClosed(`pose_sensor_failure:${reason}`, true);
+    } else {
+      this.lastEvent = this.poseSensorStatus;
+      this.emitSnapshot();
+    }
+  }
+
+  private sendPoseSample(nowUptimeMs: number): void {
+    if (!this.canSendPoseSample()) {
+      this.failClosed('pose_sample_gate_closed', true);
+      return;
+    }
+    const relative = this.currentRelativeQuaternion();
+    if (relative === undefined) {
+      this.failClosed('pose_relative_orientation_invalid', true);
+      return;
+    }
+
+    let delta = new Angular3();
+    if (!this.posePrimePending && this.posePreviousSentRelative !== undefined) {
+      if (this.poseLastSensorTimestampMs === this.poseLastSentSensorTimestampMs) {
+        return;
+      }
+      const sensorIntervalMs = this.poseLastSensorTimestampMs - this.poseLastSentSensorTimestampMs;
+      if (sensorIntervalMs < POSE_MIN_SENT_INTERVAL_MS) {
+        return;
+      }
+      if (sensorIntervalMs > POSE_MAX_SENT_INTERVAL_MS) {
+        this.clearPoseCalibration();
+        this.failClosed('pose_sent_sample_interval_invalid', true);
+        return;
+      }
+      const deltaQuaternion = this.multiplyQuaternion(
+        relative,
+        this.inverseQuaternion(this.posePreviousSentRelative)
+      );
+      delta = this.mapPhoneDeltaToTcp(this.quaternionToRotationVector(deltaQuaternion));
+      if (this.angularMagnitude(delta) > POSE_MAX_COMMAND_DELTA_RAD) {
+        this.clearPoseCalibration();
+        this.failClosed('pose_command_delta_jump', true);
+        return;
+      }
+      const derivedAngularRps = this.angularMagnitude(delta) / (sensorIntervalMs / 1000);
+      if (!Number.isFinite(derivedAngularRps) || derivedAngularRps > POSE_MAX_INPUT_ANGULAR_RPS) {
+        this.clearPoseCalibration();
+        this.failClosed('pose_derived_angular_velocity_invalid', true);
+        return;
+      }
+    }
+
+    const poseSequence = this.nextSeq;
+    const sent = this.sendEnvelope('pose.sample', new PoseSampleBody(
+      this.leaseId,
+      this.poseCalibrationId,
+      this.poseLastSensorTimestampMs,
+      this.poseConfidence,
+      delta
+    ));
+    if (sent) {
+      this.pendingPoseAckSeqs.push(poseSequence);
+      if (this.pendingPoseAckSeqs.length > 32) {
+        this.failClosed('pose_ack_backlog', true);
+        return;
+      }
+      this.posePreviousSentRelative = this.copyQuaternion(relative);
+      this.poseLastSentSensorTimestampMs = this.poseLastSensorTimestampMs;
+      this.posePrimePending = false;
+      this.poseLastDelta = delta;
+      this.lastMotionSentAtUptimeMs = nowUptimeMs;
+    }
+  }
+
+  private canCalibratePose(): boolean {
+    return !this.deadmanHeld && !this.poseDeadmanHeld && this.activeAxis === AxisName.NONE &&
+      this.poseSensorActive && this.poseTracking && this.isPoseSensorFresh() &&
+      this.poseLatestQuaternion !== undefined && this.hasSafeLease(false);
+  }
+
+  private canSendPoseSample(): boolean {
+    return this.poseSensorActive && this.poseTracking && this.isPoseSensorFresh() &&
+      this.poseCalibrationQuaternion !== undefined && this.poseCalibrationId.length > 0 &&
+      this.poseLatestQuaternion !== undefined && this.hasSafeLease(this.poseDeadmanHeld);
+  }
+
+  private isPoseSensorFresh(): boolean {
+    const nowUptimeMs = this.monotonicNowMs();
+    const ageMs = nowUptimeMs - this.poseLastSensorTimestampMs;
+    return nowUptimeMs >= 0 && this.poseLastSensorTimestampMs > 0 && ageMs >= 0 && ageMs <= POSE_SENSOR_STALE_MS;
+  }
+
+  private currentRelativeQuaternion(): Quaternion4 | undefined {
+    if (this.poseCalibrationQuaternion === undefined || this.poseLatestQuaternion === undefined) {
+      return undefined;
+    }
+    return this.multiplyQuaternion(
+      this.inverseQuaternion(this.poseCalibrationQuaternion),
+      this.poseLatestQuaternion
+    );
+  }
+
+  private normalizeQuaternion(x: number, y: number, z: number, w: number): Quaternion4 | undefined {
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z) || !Number.isFinite(w)) {
+      return undefined;
+    }
+    const magnitudeSquared = x * x + y * y + z * z + w * w;
+    if (!Number.isFinite(magnitudeSquared) || magnitudeSquared < 0.25 || magnitudeSquared > 2.25) {
+      return undefined;
+    }
+    const magnitude = Math.sqrt(magnitudeSquared);
+    const normalized = new Quaternion4();
+    normalized.x = x / magnitude;
+    normalized.y = y / magnitude;
+    normalized.z = z / magnitude;
+    normalized.w = w / magnitude;
+    if (this.posePreviousRawQuaternion !== undefined &&
+      this.quaternionDot(normalized, this.posePreviousRawQuaternion) < 0) {
+      normalized.x = -normalized.x;
+      normalized.y = -normalized.y;
+      normalized.z = -normalized.z;
+      normalized.w = -normalized.w;
+    }
+    return normalized;
+  }
+
+  private multiplyQuaternion(left: Quaternion4, right: Quaternion4): Quaternion4 {
+    const result = new Quaternion4();
+    result.x = left.w * right.x + left.x * right.w + left.y * right.z - left.z * right.y;
+    result.y = left.w * right.y - left.x * right.z + left.y * right.w + left.z * right.x;
+    result.z = left.w * right.z + left.x * right.y - left.y * right.x + left.z * right.w;
+    result.w = left.w * right.w - left.x * right.x - left.y * right.y - left.z * right.z;
+    const normalized = this.normalizeQuaternionIndependent(result);
+    return normalized === undefined ? new Quaternion4() : normalized;
+  }
+
+  private inverseQuaternion(value: Quaternion4): Quaternion4 {
+    const result = new Quaternion4();
+    result.x = -value.x;
+    result.y = -value.y;
+    result.z = -value.z;
+    result.w = value.w;
+    return result;
+  }
+
+  private normalizeQuaternionIndependent(value: Quaternion4): Quaternion4 | undefined {
+    const magnitude = Math.sqrt(
+      value.x * value.x + value.y * value.y + value.z * value.z + value.w * value.w
+    );
+    if (!Number.isFinite(magnitude) || magnitude < 0.000001) {
+      return undefined;
+    }
+    const result = new Quaternion4();
+    result.x = value.x / magnitude;
+    result.y = value.y / magnitude;
+    result.z = value.z / magnitude;
+    result.w = value.w / magnitude;
+    return result;
+  }
+
+  private quaternionToRotationVector(value: Quaternion4): Angular3 {
+    const normalized = this.normalizeQuaternionIndependent(value);
+    const result = new Angular3();
+    if (normalized === undefined) {
+      return result;
+    }
+    if (normalized.w < 0) {
+      normalized.x = -normalized.x;
+      normalized.y = -normalized.y;
+      normalized.z = -normalized.z;
+      normalized.w = -normalized.w;
+    }
+    const vectorMagnitude = Math.sqrt(
+      normalized.x * normalized.x + normalized.y * normalized.y + normalized.z * normalized.z
+    );
+    if (vectorMagnitude < 0.000001) {
+      return result;
+    }
+    const angle = 2 * Math.atan2(vectorMagnitude, Math.max(0, normalized.w));
+    const scale = angle / vectorMagnitude;
+    result.rx = normalized.x * scale;
+    result.ry = normalized.y * scale;
+    result.rz = normalized.z * scale;
+    return result;
+  }
+
+  private quaternionDot(left: Quaternion4, right: Quaternion4): number {
+    return left.x * right.x + left.y * right.y + left.z * right.z + left.w * right.w;
+  }
+
+  private angularMagnitude(value: Angular3): number {
+    return Math.sqrt(value.rx * value.rx + value.ry * value.ry + value.rz * value.rz);
+  }
+
+  private mapPhoneDeltaToTcp(phoneDelta: Angular3): Angular3 {
+    const tcpDelta = new Angular3();
+    tcpDelta.rx = phoneDelta.ry * POSE_TCP_RX_FROM_PHONE_Y_SIGN;
+    tcpDelta.ry = phoneDelta.rx * POSE_TCP_RY_FROM_PHONE_X_SIGN;
+    tcpDelta.rz = phoneDelta.rz * POSE_TCP_RZ_FROM_PHONE_Z_SIGN;
+    return tcpDelta;
+  }
+
+  private poseConfidenceForAccuracy(accuracy: number): number {
+    if (accuracy >= 3) {
+      return 1;
+    }
+    if (accuracy === 2) {
+      return 0.8;
+    }
+    if (accuracy === 1) {
+      return 0.6;
+    }
+    return 0;
+  }
+
+  private copyQuaternion(value: Quaternion4): Quaternion4 {
+    const result = new Quaternion4();
+    result.x = value.x;
+    result.y = value.y;
+    result.z = value.z;
+    result.w = value.w;
+    return result;
+  }
+
+  private removePendingPoseAck(sequence: number): boolean {
+    const index = this.pendingPoseAckSeqs.indexOf(sequence);
+    if (index < 0) {
+      return false;
+    }
+    this.pendingPoseAckSeqs.splice(index, 1);
+    return true;
+  }
+
+  private emitSnapshotThrottled(nowUptimeMs: number): void {
+    if (nowUptimeMs - this.lastUiEmitAtUptimeMs >= 250) {
+      this.emitSnapshot();
+    }
+  }
+
+  private isAnyMotionActive(): boolean {
+    return this.poseDeadmanHeld || (this.deadmanHeld && this.activeAxis !== AxisName.NONE);
   }
 
   private sendStop(reason: string): void {
@@ -751,10 +1272,14 @@ export class TeleopClient {
     }
     this.deadmanHeld = false;
     this.deadmanTouchId = -1;
+    this.poseDeadmanHeld = false;
+    this.poseDeadmanTouchId = -1;
     this.activeAxis = AxisName.NONE;
     this.axisDirection = 0;
     this.axisTouchId = -1;
     this.recording = false;
+    this.clearPoseCalibration();
+    this.pendingPoseAckSeqs = [];
     if (clearLease) {
       this.leaseId = '';
       this.leaseExpiresAtMs = 0;
@@ -788,6 +1313,7 @@ export class TeleopClient {
     }
     this.stopCommandLoop();
     this.clearConnectTimer();
+    this.stopPoseSensorInternal(true);
     this.socket = undefined;
     this.connected = false;
     this.welcomed = false;
@@ -814,6 +1340,7 @@ export class TeleopClient {
   private markDisconnected(reason: string): void {
     this.stopCommandLoop();
     this.clearConnectTimer();
+    this.stopPoseSensorInternal(true);
     this.socket = undefined;
     this.connected = false;
     this.welcomed = false;
@@ -831,12 +1358,17 @@ export class TeleopClient {
     this.leaseDeadlineUptimeMs = 0;
     this.deadmanHeld = false;
     this.deadmanTouchId = -1;
+    this.poseDeadmanHeld = false;
+    this.poseDeadmanTouchId = -1;
     this.activeAxis = AxisName.NONE;
     this.axisDirection = 0;
     this.axisTouchId = -1;
+    this.clearPoseCalibration();
+    this.pendingPoseAckSeqs = [];
   }
 
   private resetConnectionState(): void {
+    this.stopPoseSensorInternal(true);
     this.connected = false;
     this.welcomed = false;
     this.sessionId = '';
@@ -865,6 +1397,33 @@ export class TeleopClient {
     this.clearLocalControl();
   }
 
+  private stopPoseSensorInternal(clearCalibration: boolean): void {
+    const stopped = this.poseSensor.stop();
+    this.poseSensorActive = false;
+    this.poseTracking = false;
+    this.poseAccuracy = 0;
+    this.poseConfidence = 0;
+    this.poseLastSensorTimestampMs = 0;
+    this.poseLastSentSensorTimestampMs = 0;
+    this.poseLatestQuaternion = undefined;
+    this.posePreviousRawQuaternion = undefined;
+    this.poseDeadmanHeld = false;
+    this.poseDeadmanTouchId = -1;
+    if (clearCalibration) {
+      this.clearPoseCalibration();
+    }
+    this.poseSensorStatus = stopped ? '姿态传感器未启用' : '传感器取消订阅失败；回调已在本地屏蔽';
+  }
+
+  private clearPoseCalibration(): void {
+    this.poseCalibrationQuaternion = undefined;
+    this.posePreviousSentRelative = undefined;
+    this.poseLastSentSensorTimestampMs = 0;
+    this.poseCalibrationId = '';
+    this.posePrimePending = false;
+    this.poseLastDelta = new Angular3();
+  }
+
   private clearConnectTimer(): void {
     if (this.connectTimerId >= 0) {
       clearTimeout(this.connectTimerId);
@@ -884,7 +1443,7 @@ export class TeleopClient {
     const snapshot = new TeleopSnapshot();
     const profile = this.speedProfiles[this.speedIndex];
     const nowUptimeMs = this.monotonicNowMs();
-    const allowMoving = this.deadmanHeld && this.activeAxis !== AxisName.NONE;
+    const allowMoving = this.isAnyMotionActive();
     snapshot.connected = this.connected;
     snapshot.welcomed = this.welcomed;
     snapshot.foreground = this.foreground;
@@ -913,6 +1472,19 @@ export class TeleopClient {
     snapshot.recording = this.recording;
     snapshot.episodeId = this.episodeId;
     snapshot.deadmanHeld = this.deadmanHeld;
+    snapshot.poseSensorActive = this.poseSensorActive;
+    snapshot.poseSensorStatus = this.poseSensorStatus;
+    snapshot.poseTracking = this.poseTracking && this.isPoseSensorFresh();
+    snapshot.poseAccuracy = this.poseAccuracy;
+    snapshot.poseConfidence = this.poseConfidence;
+    snapshot.poseSampleAgeMs = nowUptimeMs < 0 || this.poseLastSensorTimestampMs <= 0 ? -1 :
+      Math.max(0, nowUptimeMs - this.poseLastSensorTimestampMs);
+    snapshot.poseCalibrated = this.poseCalibrationQuaternion !== undefined && this.poseCalibrationId.length > 0;
+    snapshot.poseCalibrationIdDisplay = this.maskIdentifier(this.poseCalibrationId);
+    snapshot.poseDeadmanHeld = this.poseDeadmanHeld;
+    snapshot.poseDeltaText = this.formatPoseDelta();
+    snapshot.canCalibratePose = this.canCalibratePose();
+    snapshot.canPoseCommand = this.canSendPoseSample();
     snapshot.baseStationary = this.safetyAck.base_stationary;
     snapshot.workspaceClear = this.safetyAck.workspace_clear;
     snapshot.estopAccessible = this.safetyAck.estop_accessible;
@@ -933,6 +1505,11 @@ export class TeleopClient {
     }
     return `x ${this.tcp.x.toFixed(4)}  y ${this.tcp.y.toFixed(4)}  z ${this.tcp.z.toFixed(4)}\n` +
       `rx ${this.tcp.rx.toFixed(3)}  ry ${this.tcp.ry.toFixed(3)}  rz ${this.tcp.rz.toFixed(3)}`;
+  }
+
+  private formatPoseDelta(): string {
+    return `rx ${this.poseLastDelta.rx.toFixed(4)}  ry ${this.poseLastDelta.ry.toFixed(4)}  ` +
+      `rz ${this.poseLastDelta.rz.toFixed(4)} rad`;
   }
 
   private formatJoints(): string {

@@ -6,6 +6,19 @@ export const REQUESTED_LEASE_MS: number = 2000;
 export const OPERATOR_HOLD_MS: number = 1500;
 export const MAX_WATCHDOG_MS: number = 300;
 export const ROBOT_STATE_STALE_MS: number = 1000;
+export const POSE_SAMPLE_PERIOD_MS: number = COMMAND_PERIOD_MS;
+export const POSE_SENSOR_STALE_MS: number = 150;
+export const POSE_MAX_SAMPLE_GAP_MS: number = 250;
+export const POSE_MIN_SENT_INTERVAL_MS: number = 20;
+export const POSE_MAX_SENT_INTERVAL_MS: number = 150;
+export const POSE_MAX_INPUT_ANGULAR_RPS: number = 6;
+export const POSE_MAX_SENSOR_JUMP_RAD: number = 0.6108652381980153;
+export const POSE_MAX_RELATIVE_ANGLE_RAD: number = 0.5235987755982988;
+export const POSE_MAX_COMMAND_DELTA_RAD: number = 0.20943951023931953;
+export const POSE_MIN_ACCURACY: number = 2;
+export const POSE_TCP_RX_FROM_PHONE_Y_SIGN: number = 1;
+export const POSE_TCP_RY_FROM_PHONE_X_SIGN: number = -1;
+export const POSE_TCP_RZ_FROM_PHONE_Z_SIGN: number = 1;
 
 export class AxisName {
   static readonly NONE: string = 'none';
@@ -27,6 +40,13 @@ export class Angular3 {
   rx: number = 0;
   ry: number = 0;
   rz: number = 0;
+}
+
+export class Quaternion4 {
+  x: number = 0;
+  y: number = 0;
+  z: number = 0;
+  w: number = 1;
 }
 
 export class Pose6 {
@@ -70,7 +90,8 @@ export class HelloBody {
   capabilities: Array<string> = [
     'cartesian_velocity',
     'gripper',
-    'recording'
+    'recording',
+    'pose_sample'
   ];
 
   constructor(clientId: string, authToken: string) {
@@ -143,6 +164,32 @@ export class GripperBody {
   constructor(leaseId: string, positionPct: number) {
     this.lease_id = leaseId;
     this.position_pct = positionPct;
+  }
+}
+
+export class PoseSampleBody {
+  lease_id: string;
+  deadman: boolean = true;
+  frame: string = 'phone_calibrated';
+  mapping: string = 'tcp_orientation';
+  calibration_id: string;
+  sensor_timestamp_ms: number;
+  tracking_state: string = 'tracking';
+  confidence: number;
+  angular_delta_rad: Angular3;
+
+  constructor(
+    leaseId: string,
+    calibrationId: string,
+    sensorTimestampMs: number,
+    confidence: number,
+    angularDeltaRad: Angular3
+  ) {
+    this.lease_id = leaseId;
+    this.calibration_id = calibrationId;
+    this.sensor_timestamp_ms = sensorTimestampMs;
+    this.confidence = confidence;
+    this.angular_delta_rad = angularDeltaRad;
   }
 }
 

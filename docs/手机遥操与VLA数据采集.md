@@ -2,12 +2,16 @@
 
 ## 1. 结论
 
-可以为 LM3-UP 做手机遥操并用示范数据后训练 LingBot-VLA，但不能把公开的手机遥操项目或 LingBot 权重直接连接到真机。
+可以为 LM3-UP 做基于手机姿态传感器的遥操，并用示范数据后训练 LingBot-VLA，但不能把公开的手机遥操项目或 LingBot 权重直接连接到真机。
+
+这里的“手机陀螺仪遥操”会先在 Android/HarmonyOS 上确认设备存在硬件陀螺仪；缺失时姿态模式直接禁用。通过门禁后采用系统融合的 **Rotation Vector**，而不是直接积分原始角速度。Rotation Vector 以陀螺仪为主要动态来源，并结合其他 IMU 数据抑制漂移。它能可靠表达手机的 3DoF 旋转，不能可靠测量手机在空间中的 X/Y/Z 平移，因此本实现把手机旋转映射到 LM3 TCP 的 `Rx/Ry/Rz`，把原有触屏轴键保留为 `X/Y/Z` 平移输入，不伪造手机 6DoF 位置。
 
 首版采用：
 
 ```text
 Android / HarmonyOS 原生 App
+  Rotation Vector → TCP Rx/Ry/Rz
+  触屏轴键      → TCP X/Y/Z
         ↓ lm3-teleop.v1 WebSocket
 Python 安全桥（默认模拟器）
         ↓ 显式真机模式
@@ -37,23 +41,27 @@ stateDiagram-v2
 
 ## 2. Seeed 项目到底做了什么
 
-用户提供的 `Seeed-Studio/wiki-documents` 是文档站点。关联的 Phosphobot 实现中，手机网页持续发送 X/Y/Z/Rx/Ry/Rz 相对增量，机器人侧接口完成坐标处理、逆解和动作执行。这证明“手机界面只表达末端意图，机器人侧负责运动学与硬件”是可行的架构。
+用户提供的 `Seeed-Studio/wiki-documents` 是文档站点。它明确展示了键盘/鼠标、Leader 主臂、手动拖动和 VR 遥操，但没有提供通过手机陀螺仪控制机械臂的源码。
+
+关联的 Phosphobot 可以作为 VR 架构参考：其 `/move/teleop/ws` 接收的位置与欧拉角模型在源码中明确写成 Meta Quest 数据，控制页也列出 Meta Quest 2/Pro/3/3S。机器人侧再完成坐标转换、逆解和硬件执行。它不能作为“已有手机陀螺仪实现”的证据，先前把它描述成手机网页持续发送 X/Y/Z/Rx/Ry/Rz 的说法不准确。
 
 它不能原样用于 LM3-UP，原因包括：
 
 - 上游面向其他机械臂和开发环境，没有 LM3-UP 的工作空间、夹爪和底盘互锁；
 - 默认网络暴露和跨域设置不满足机器人控制网要求；
 - 没有本机手册要求下的单写入者、长按解锁、失联看门狗和真机显式启用门槛；
-- HTTP 相对位移请求并不天然保证停止、顺序、过期处理或运动缓冲有界。
+- 上游 VR WebSocket 并不具备本仓库要求的单租约、严格时序、传感器新鲜度和失败关闭语义。
 
-LeRobot v0.4.2 的 `examples/phone_to_so100` 更进一步，形成“手机 6DoF 姿态 → 末端位姿 → 边界/安全 → IK → 关节动作”的管线，并可进入 LeRobot 录制流程。但 Android WebXR/ARCore 与 HarmonyOS 的位置跟踪支持不同，也没有 LM3 的标定，因此本仓库首版只启用稳定、可预测的原生触屏速度控制，并在协议中预留 `pose.sample`。
+LeRobot v0.4.2 的 `examples/phone_to_so100` 是更接近的参考：Android 使用 WebXR，iOS 使用 ARKit/HEBI Mobile I/O，形成“手机 6DoF AR 位姿 → 末端目标 → 边界/安全 → IK → 关节动作”的管线。它依赖平台空间跟踪，不等同于纯陀螺仪，也没有 LM3、HarmonyOS、UP 底盘互锁或本仓库的安全协议。
+
+本仓库因此采用跨 Android/HarmonyOS 都可获得的原生 Rotation Vector，只执行相邻样本的旋转增量。标准握持约定为屏幕朝上、手机顶部指向机器人基坐标 `+X`，固定映射为 `[phone_x, phone_y, phone_z] → [tcp_ry 负向, tcp_rx 正向, tcp_rz 正向]`，即 `[tcp_rx,tcp_ry,tcp_rz]=[phone_y,-phone_x,phone_z]`；首次使用仍必须在模拟器逐轴验向。每次进入模式都生成新的 `calibration_id` 并显式归零；首帧只建立基线不运动。手机端最多 20 Hz 发送，服务端再次检查租约、DEADMAN、时间递增、采样间隔、置信度、有限数值、单帧跳变和角速度，再转换为受限 TCP 角速度。
 
 ## 3. 三端职责
 
 | 组件 | 负责 | 不负责 |
 | --- | --- | --- |
-| Android App | 安全检查、长按解锁、按住式六自由度输入、夹爪、录制控制、状态显示 | IK、最终限幅、底盘控制 |
-| HarmonyOS App | 与 Android 一致的触屏控制语义和生命周期停机 | 声称与 Android 相同的空间跟踪能力 |
+| Android App | 原生 Rotation Vector、归零校准、按住式陀螺仪 DEADMAN、触屏 XYZ、夹爪、录制与状态显示 | 从陀螺仪推断 XYZ、IK、最终限幅、底盘控制 |
+| HarmonyOS App | 使用 `SensorId.ROTATION_VECTOR` 实现相同的 3DoF 旋转协议和生命周期停机 | 声称拥有未实现的 AR 6DoF 空间跟踪能力 |
 | Python 安全桥 | 认证、最长 2000 ms 单写入者租约、仅 IDLE 授权、严格单槽 20 Hz 限流、300 ms watchdog、连续运动反馈冻结检测、工作空间、pylebai、记录 | 解除急停、自动上使能、底盘导航或持续读取 UP 硬件互锁 |
 | 外部 GPU 主机 | LingBot 数据处理、后训练、推理/影子模式 | 绕过安全桥直接写机器人 |
 | UP 确定性控制器 | 导航、状态确认、底盘锁定与释放 | 接收 VLA 低层轮速 |
@@ -67,6 +75,7 @@ LeRobot v0.4.2 的 `examples/phone_to_so100` 更进一步，形成“手机 6DoF
 - 300 ms 内没有新的有效 deadman 运动命令；
 - App 进入后台、WebSocket 断开或控制租约过期；
 - 序号重复/倒退、消息过期、速率超限或字段不是有限数值；
+- 姿态样本未跟踪、置信度不足、传感器时间倒退/间隔异常、样本陈旧或旋转跳变；
 - 机器人状态不允许运动、急停存在、底盘未被确认锁定；
 - TCP 当前或预测位置超出现场配置的工作空间；
 - 后端异常、反馈停滞或命令执行结果无法确认。
@@ -100,7 +109,7 @@ episode 的 `metadata.json` 保存任务文本、模式、终端和相机清单�
 - 服务端单调时间、Unix 时间、episode/frame 序号；
 - 6 个实际关节角和关节速度；
 - 实际 TCP 位姿和夹爪反馈；
-- 手机发来的笛卡尔速度、deadman、控制序号和网络间隔；
+- 手机发来的笛卡尔速度、陀螺仪校准 ID、传感器时间、旋转增量、deadman、控制序号和网络间隔；
 - 相机帧路径/采集时间/时间偏差；导出 LeRobot 时再把 episode 任务文本写入每个训练 row；
 - watchdog、钳制、租约、机器人状态和异常标志。
 

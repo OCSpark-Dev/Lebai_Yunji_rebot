@@ -52,7 +52,7 @@
     "platform": "android",
     "app_version": "0.1.0",
     "auth_token": "replace-with-a-random-secret",
-    "capabilities": ["cartesian_velocity", "gripper", "recording"]
+    "capabilities": ["cartesian_velocity", "pose_sample", "gripper", "recording"]
   }
 }
 ```
@@ -262,11 +262,47 @@
 
 常用错误码：`AUTH_FAILED`、`PROTOCOL_MISMATCH`、`INVALID_MESSAGE`、`OUT_OF_ORDER`、`STALE_MESSAGE`、`RATE_LIMITED`、`LEASE_BUSY`、`LEASE_REQUIRED`、`DEADMAN_REQUIRED`、`BASE_NOT_LOCKED`、`ROBOT_NOT_READY`、`WORKSPACE_LIMIT`、`UNSUPPORTED_MODE` 和 `BACKEND_ERROR`。
 
-## 9. 手机 6DoF 预留
+## 9. 手机 Rotation Vector 3DoF 增量控制
 
-能力名 `pose_sample`，消息类型 `pose.sample`，建议字段为手机局部坐标中的位置、四元数、跟踪状态和置信度。首版桥接器必须返回 `UNSUPPORTED_MODE`，不得把未经相机内参、手眼关系、坐标系和延迟标定的手机姿态直接发送给 LM3。
+能力名为 `pose_sample`，消息类型为 `pose.sample`。Android/HarmonyOS 客户端在启用该模式前必须确认设备存在硬件陀螺仪，缺失时不得发送姿态命令；随后才把系统融合后的 Rotation Vector 转换为 LM3 TCP 的 `Rx/Ry/Rz` 增量控制。该模式不接受手机位置，也不控制机械臂 `X/Y/Z` 或 UP 底盘。它不是完整 6DoF 空间跟踪，不能把 IMU 姿态描述成 ARCore/WebXR 一类的位置跟踪。
 
-Android 的 WebXR/ARCore 与 HarmonyOS 的空间跟踪能力并不等价。只有完成两端独立标定、跳变检测、重定位处理、工作空间约束和真机验证后，才允许新增姿态控制模式。
+`body` 必须**精确**包含以下字段，不允许缺字段或扩展字段：
+
+```json
+{
+  "lease_id": "a1c4...",
+  "deadman": true,
+  "frame": "phone_calibrated",
+  "mapping": "tcp_orientation",
+  "calibration_id": "9f31...",
+  "sensor_timestamp_ms": 123456,
+  "tracking_state": "tracking",
+  "confidence": 0.95,
+  "angular_delta_rad": {"rx": 0.01, "ry": 0.0, "rz": 0.0}
+}
+```
+
+客户端计算规则：
+
+1. 操作者显式归零后，计算 `q_rel = inverse(q_zero) * q_current`。
+2. 对相邻**成功写入 WebSocket** 的相对姿态计算 `q_delta = q_rel_current * inverse(q_rel_previous)`。
+3. 将四元数规范到 `w >= 0`，再转换为最短旋转矢量。
+4. 中性安装约定为手机屏幕朝上、手机顶部指向机器人基座 `+X`；手机旋转 `[x,y,z]` 映射为 TCP `[rx,ry,rz]=[y,-x,z]`。现场仍必须低速核对控制器轴向和手机安装方向。
+5. 每次按下姿态 DEADMAN 或生成新的 `calibration_id` 后，首帧必须发送零增量，只用于 priming；只有发送成功后，客户端才能提交该帧为下一次差分基线。随后若收到拒绝、超时或断连，必须失败关闭并丢弃该基线。
+
+桥接器固定执行以下服务端检查：
+
+- `deadman=true`，持有有效控制租约，`frame="phone_calibrated"`，`mapping="tcp_orientation"`。
+- `calibration_id` 非空、首尾无空白且最长 128 个字符；`tracking_state="tracking"`；`confidence` 在 `[0.8,1.0]`。
+- `sensor_timestamp_ms` 是手机启动时钟的正整数。在同一 `calibration_id` 内必须严格递增，相邻已接受样本间隔必须在 `20-150 ms`。
+- `angular_delta_rad` 必须精确包含 `rx/ry/rz` 三个有限数值，单帧范数不得超过 `0.25 rad`；由 `delta / interval` 得到的输入角速度范数不得超过 `6.0 rad/s`。
+- 所有 `pose.sample`，包括 priming 帧，都占用同一个容量为 1 的 20 Hz motion token bucket；不断切换 `calibration_id` 不能绕过限流。
+- 首帧或新 `calibration_id` 必须携带零旋转增量，只建立基线，不调用 `speedl`；非零 priming 会失败关闭。若切换标定时已有运动，桥接器先执行软件停止，保留原租约，再建立新基线。
+- 后续帧将 `X/Y/Z` 强制为零，以传感器间隔作为有限命令时长，再经过与 `motion.cartesian_velocity` 相同的角速度限幅、机器人/关节状态、TCP 工作空间、安全 epoch、watchdog 和反馈停滞检查。默认运行角速度上限仍是安全配置中的 `0.15 rad/s`；`6.0 rad/s` 只是拒绝异常输入的前置上限，不是可执行速度。
+
+任一 schema、deadman、租约、时间、置信度、跳变、限流、安全检查或后端执行错误都会失败关闭：停止机械臂、撤销租约、清除姿态基线，并返回 `error`。低置信度、传感器跳变、页面隐藏、App 后台、松开 DEADMAN 或断连时，客户端也必须立即清除本地基线并尽力发送 `motion.stop`。
+
+`sensor_timestamp_ms` 与服务端墙钟没有共同纪元，因此服务端只能验证同一标定内的顺序和间隔，不能独立证明传感器样本的绝对年龄。客户端必须用本机同源单调时钟做样本年龄检查；服务端另外只用信封 `sent_at_ms` 检查网络消息时效。两者不能互相替代。
 
 ## 10. 当前验证边界
 

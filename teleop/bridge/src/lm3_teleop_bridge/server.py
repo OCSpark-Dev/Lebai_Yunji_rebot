@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import logging
+import math
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -44,6 +45,26 @@ from .safety import (
 
 LOGGER = logging.getLogger("lm3_teleop_bridge")
 FEEDBACK_CHANGE_EPSILON = 1e-6
+POSE_MIN_CONFIDENCE = 0.8
+POSE_MIN_INTERVAL_MS = 20
+POSE_MAX_INTERVAL_MS = 150
+POSE_MAX_SINGLE_FRAME_DELTA_RAD = 0.25
+POSE_MAX_INPUT_ANGULAR_RPS = 6.0
+POSE_PRIMING_EPSILON_RAD = 1e-9
+POSE_MAX_CALIBRATION_ID_LENGTH = 128
+POSE_SAMPLE_BODY_KEYS = frozenset(
+    {
+        "lease_id",
+        "deadman",
+        "frame",
+        "mapping",
+        "calibration_id",
+        "sensor_timestamp_ms",
+        "tracking_state",
+        "confidence",
+        "angular_delta_rad",
+    }
+)
 
 
 @dataclass(slots=True)
@@ -66,6 +87,12 @@ class ClientSession:
             self.outbound_seq += 1
             payload = encode_envelope(message_type, sequence, _wall_ms(), body)
             await self.websocket.send(payload)
+
+
+@dataclass(frozen=True, slots=True)
+class PoseSampleState:
+    calibration_id: str
+    last_sensor_timestamp_ms: int
 
 
 class TeleopServer:
@@ -130,6 +157,7 @@ class TeleopServer:
         self._feedback_signature: tuple[float, ...] | None = None
         self._latest_snapshot: RobotSnapshot | None = None
         self._recording_cameras: list[str] = []
+        self._pose_states: dict[str, PoseSampleState] = {}
         self._last_command: dict[str, Any] = {
             "type": "none",
             "client_seq": None,
@@ -220,6 +248,7 @@ class TeleopServer:
             pass
         finally:
             self.sessions.pop(session.session_id, None)
+            self._pose_states.pop(session.session_id, None)
             if self.leases.current is not None and self.leases.current.session_id == session.session_id:
                 await self._safe_stop(
                     "CLIENT_DISCONNECTED",
@@ -349,7 +378,7 @@ class TeleopServer:
             error.ack_seq = envelope.seq if error.ack_seq is None else error.ack_seq
             actuator_message = (
                 envelope.type.startswith("motion.") and envelope.type != "motion.stop"
-            ) or envelope.type == "gripper.set"
+            ) or envelope.type in {"gripper.set", "pose.sample"}
             if actuator_message and self._owns_lease(session):
                 await self._safe_stop(error.code, error.message, revoke=True, stop_recording=True)
             await self._send_error(session, error)
@@ -482,10 +511,7 @@ class TeleopServer:
             await self._send_ack(session, envelope, accepted=True)
             await session.send("recording.status", status.body())
         elif message_type == "pose.sample":
-            raise ProtocolError(
-                "UNSUPPORTED_MODE",
-                "phone pose control is reserved until LM3-specific calibration is complete",
-            )
+            await self._pose_sample(session, envelope)
 
     async def _control_acquire(self, session: ClientSession, envelope: Envelope) -> None:
         body = envelope.body
@@ -574,6 +600,171 @@ class TeleopServer:
         angular = require_vector(body, "angular_rps", ("rx", "ry", "rz"))
         requested_duration = require_int(body, "duration_ms")
         lease = self._require_lease(session, body)
+        await self._execute_cartesian_velocity(
+            session,
+            envelope,
+            lease=lease,
+            linear=linear,
+            angular=angular,
+            requested_duration=requested_duration,
+        )
+
+    async def _pose_sample(self, session: ClientSession, envelope: Envelope) -> None:
+        body = envelope.body
+        if set(body) != POSE_SAMPLE_BODY_KEYS:
+            missing = sorted(POSE_SAMPLE_BODY_KEYS - set(body))
+            extra = sorted(set(body) - POSE_SAMPLE_BODY_KEYS)
+            detail = []
+            if missing:
+                detail.append(f"missing={','.join(missing)}")
+            if extra:
+                detail.append(f"extra={','.join(extra)}")
+            raise ProtocolError(
+                "INVALID_MESSAGE",
+                "pose.sample body must contain exactly the v1 fields"
+                + (f" ({'; '.join(detail)})" if detail else ""),
+            )
+        if require_bool(body, "deadman") is not True:
+            raise ProtocolError("DEADMAN_REQUIRED", "pose.sample deadman must be true")
+        if require_string(body, "frame") != "phone_calibrated":
+            raise ProtocolError(
+                "UNSUPPORTED_MODE", "pose.sample frame must be phone_calibrated"
+            )
+        if require_string(body, "mapping") != "tcp_orientation":
+            raise ProtocolError(
+                "UNSUPPORTED_MODE", "pose.sample mapping must be tcp_orientation"
+            )
+        calibration_id = require_string(body, "calibration_id")
+        if (
+            calibration_id != calibration_id.strip()
+            or len(calibration_id) > POSE_MAX_CALIBRATION_ID_LENGTH
+        ):
+            raise ProtocolError(
+                "INVALID_MESSAGE",
+                f"calibration_id must be trimmed and at most {POSE_MAX_CALIBRATION_ID_LENGTH} characters",
+            )
+        if require_string(body, "tracking_state") != "tracking":
+            raise ProtocolError("INVALID_MESSAGE", "pose tracking_state must be tracking")
+        confidence = require_number(body, "confidence")
+        if not POSE_MIN_CONFIDENCE <= confidence <= 1.0:
+            raise ProtocolError(
+                "INVALID_MESSAGE",
+                f"pose confidence must be between {POSE_MIN_CONFIDENCE} and 1.0",
+            )
+        sensor_timestamp_ms = require_int(body, "sensor_timestamp_ms")
+        if sensor_timestamp_ms <= 0:
+            raise ProtocolError("INVALID_MESSAGE", "sensor_timestamp_ms must be positive")
+        angular_delta = _require_exact_vector(
+            body, "angular_delta_rad", ("rx", "ry", "rz")
+        )
+        delta_norm = _vector_norm(angular_delta)
+        if delta_norm > POSE_MAX_SINGLE_FRAME_DELTA_RAD:
+            raise ProtocolError(
+                "INVALID_MESSAGE",
+                "pose angular_delta_rad exceeds the single-frame jump limit",
+            )
+        lease = self._require_lease(session, body)
+        state = self._pose_states.get(session.session_id)
+        if state is None or state.calibration_id != calibration_id:
+            if delta_norm > POSE_PRIMING_EPSILON_RAD:
+                raise ProtocolError(
+                    "INVALID_MESSAGE",
+                    "the first pose sample for a calibration must carry zero angular delta",
+                )
+            if not session.motion_bucket.consume():
+                raise ProtocolError("RATE_LIMITED", "motion command rate exceeds 20 Hz")
+            if self._motion_active:
+                await self._execute_stop()
+                lease = self._require_lease(session, body)
+            self._pose_states[session.session_id] = PoseSampleState(
+                calibration_id=calibration_id,
+                last_sensor_timestamp_ms=sensor_timestamp_ms,
+            )
+            received_at_ms = _wall_ms()
+            self._last_command = {
+                "type": envelope.type,
+                "client_seq": envelope.seq,
+                "sent_at_ms": envelope.sent_at_ms,
+                "received_at_ms": received_at_ms,
+                "network_age_ms": max(0, received_at_ms - envelope.sent_at_ms),
+                "deadman": True,
+                "linear_mps": [0.0, 0.0, 0.0],
+                "angular_rps": [0.0, 0.0, 0.0],
+                "duration_ms": 0,
+                "clamped": False,
+                "priming": True,
+                "frame": "phone_calibrated",
+                "mapping": "tcp_orientation",
+                "calibration_id": calibration_id,
+                "sensor_timestamp_ms": sensor_timestamp_ms,
+                "sensor_interval_ms": None,
+                "tracking_state": "tracking",
+                "confidence": confidence,
+                "angular_delta_rad": list(angular_delta),
+                "input_angular_rps": [0.0, 0.0, 0.0],
+            }
+            await self._send_ack(
+                session,
+                envelope,
+                accepted=True,
+                clamped=False,
+                detail="pose calibration primed; no motion executed",
+            )
+            await self._maybe_send_lease_status(session, force=False)
+            return
+
+        interval_ms = sensor_timestamp_ms - state.last_sensor_timestamp_ms
+        if interval_ms <= 0:
+            raise ProtocolError(
+                "INVALID_MESSAGE", "sensor_timestamp_ms must increase strictly"
+            )
+        if not POSE_MIN_INTERVAL_MS <= interval_ms <= POSE_MAX_INTERVAL_MS:
+            raise ProtocolError(
+                "INVALID_MESSAGE",
+                f"pose sensor interval must be between {POSE_MIN_INTERVAL_MS} and {POSE_MAX_INTERVAL_MS} ms",
+            )
+        interval_s = interval_ms / 1_000
+        input_angular = tuple(component / interval_s for component in angular_delta)
+        if _vector_norm(input_angular) > POSE_MAX_INPUT_ANGULAR_RPS:
+            raise ProtocolError(
+                "INVALID_MESSAGE", "pose-derived angular velocity exceeds the input limit"
+            )
+        await self._execute_cartesian_velocity(
+            session,
+            envelope,
+            lease=lease,
+            linear=(0.0, 0.0, 0.0),
+            angular=input_angular,
+            requested_duration=interval_ms,
+            audit={
+                "priming": False,
+                "frame": "phone_calibrated",
+                "mapping": "tcp_orientation",
+                "calibration_id": calibration_id,
+                "sensor_timestamp_ms": sensor_timestamp_ms,
+                "sensor_interval_ms": interval_ms,
+                "tracking_state": "tracking",
+                "confidence": confidence,
+                "angular_delta_rad": list(angular_delta),
+                "input_angular_rps": list(input_angular),
+            },
+        )
+        self._pose_states[session.session_id] = PoseSampleState(
+            calibration_id=calibration_id,
+            last_sensor_timestamp_ms=sensor_timestamp_ms,
+        )
+
+    async def _execute_cartesian_velocity(
+        self,
+        session: ClientSession,
+        envelope: Envelope,
+        *,
+        lease: Lease,
+        linear: tuple[float, float, float],
+        angular: tuple[float, float, float],
+        requested_duration: int,
+        audit: dict[str, Any] | None = None,
+    ) -> None:
         command_epoch = self._safety_epoch
         if not session.motion_bucket.consume():
             raise ProtocolError("RATE_LIMITED", "motion command rate exceeds 20 Hz")
@@ -614,12 +805,13 @@ class TeleopServer:
         )
         self._motion_active = True
         self._last_valid_motion = now_mono
-        self._last_command = {
+        received_at_ms = _wall_ms()
+        last_command = {
             "type": envelope.type,
             "client_seq": envelope.seq,
             "sent_at_ms": envelope.sent_at_ms,
-            "received_at_ms": _wall_ms(),
-            "network_age_ms": max(0, _wall_ms() - envelope.sent_at_ms),
+            "received_at_ms": received_at_ms,
+            "network_age_ms": max(0, received_at_ms - envelope.sent_at_ms),
             "deadman": True,
             "linear_mps": list(linear),
             "angular_rps": list(angular),
@@ -627,6 +819,9 @@ class TeleopServer:
             "clamped": clamped,
             "motion_id": motion_id,
         }
+        if audit:
+            last_command.update(audit)
+        self._last_command = last_command
         await self._send_ack(session, envelope, accepted=True, clamped=clamped)
         await self._maybe_send_lease_status(session, force=False)
 
@@ -993,6 +1188,7 @@ class TeleopServer:
         self._motion_active = False
         self._feedback_motion_expected = False
         self._motion_command_expires_monotonic = 0.0
+        self._pose_states.clear()
 
     def _observe_feedback(self, snapshot: RobotSnapshot) -> None:
         signature = (
@@ -1018,6 +1214,21 @@ class TeleopServer:
 
 def _wall_ms() -> int:
     return int(time.time() * 1_000)
+
+
+def _require_exact_vector(
+    body: dict[str, Any], key: str, axes: tuple[str, str, str]
+) -> tuple[float, float, float]:
+    value = body.get(key)
+    if not isinstance(value, dict) or set(value) != set(axes):
+        raise ProtocolError(
+            "INVALID_MESSAGE", f"{key} must contain exactly {', '.join(axes)}"
+        )
+    return tuple(require_number(value, axis) for axis in axes)  # type: ignore[return-value]
+
+
+def _vector_norm(vector: tuple[float, float, float]) -> float:
+    return math.sqrt(sum(component * component for component in vector))
 
 
 def _raw_message_type(text: str) -> str | None:

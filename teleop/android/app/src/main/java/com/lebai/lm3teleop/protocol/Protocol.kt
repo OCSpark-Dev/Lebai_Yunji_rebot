@@ -265,7 +265,7 @@ object ProtocolBodies {
         .put("auth_token", authToken)
         .put(
             "capabilities",
-            JSONArray(listOf("cartesian_velocity", "gripper", "recording")),
+            JSONArray(listOf("cartesian_velocity", "pose_sample", "gripper", "recording")),
         )
 
     fun controlAcquire(safety: SafetyAcknowledgement): JSONObject = JSONObject()
@@ -304,6 +304,40 @@ object ProtocolBodies {
                 .put("rz", angularRps.z),
         )
         .put("duration_ms", 100)
+
+    fun poseSample(
+        leaseId: String,
+        calibrationId: String,
+        sensorTimestampMs: Long,
+        confidence: Double,
+        angularDeltaRad: Vector3,
+    ): JSONObject {
+        require(leaseId.isNotBlank()) { "leaseId must not be blank" }
+        require(calibrationId.isNotBlank()) { "calibrationId must not be blank" }
+        require(sensorTimestampMs > 0L) { "sensorTimestampMs must be positive" }
+        require(confidence.isFinite() && confidence in 0.0..1.0) { "confidence must be finite and in 0..1" }
+        require(
+            angularDeltaRad.x.isFinite() &&
+                angularDeltaRad.y.isFinite() &&
+                angularDeltaRad.z.isFinite(),
+        ) { "angular delta must be finite" }
+        return JSONObject()
+            .put("lease_id", leaseId)
+            .put("deadman", true)
+            .put("frame", "phone_calibrated")
+            .put("mapping", "tcp_orientation")
+            .put("calibration_id", calibrationId)
+            .put("sensor_timestamp_ms", sensorTimestampMs)
+            .put("tracking_state", "tracking")
+            .put("confidence", confidence)
+            .put(
+                "angular_delta_rad",
+                JSONObject()
+                    .put("rx", angularDeltaRad.x)
+                    .put("ry", angularDeltaRad.y)
+                    .put("rz", angularDeltaRad.z),
+            )
+    }
 
     fun motionStop(leaseId: String?, reason: String): JSONObject = JSONObject().apply {
         if (leaseId != null) put("lease_id", leaseId)

@@ -8,6 +8,8 @@
 - 单一控制租约、1500 ms 客户端长按声明和四项现场检查；租约配置/请求范围为 500–2000 ms，服务端上限始终为 2000 ms；
 - 只有乐白官方状态码 `5 (IDLE)` 可取得租约，`7 (MOVING)` 和其他状态一律拒绝；
 - 严格单槽 20 Hz token-bucket 限速，不允许客户端靠积攒令牌突发双发；另有 300 ms 独立 watchdog；
+- `pose.sample` 已实现手机 Rotation Vector 的 TCP 旋转 3DoF 增量控制：只执行 `Rx/Ry/Rz`，强制 `X/Y/Z=0`；每个 `calibration_id` 首帧必须为零增量并只做 priming，非零 priming 失败关闭，切换标定时先停止旧运动；priming 帧同样占用 20 Hz motion token，不能靠反复换标定绕过限流；
+- 姿态消息只接受精确 v1 schema、`phone_calibrated/tcp_orientation`、`tracking`、`confidence>=0.8`；同一标定内的传感器间隔限 `20-150 ms`，单帧旋转增量范数限 `0.25 rad`，派生输入角速度范数限 `6.0 rad/s`，之后仍按安全配置把实际角速度钳制到默认 `0.15 rad/s`；
 - 连续有效的非零笛卡尔命令期间，若关节与 TCP 反馈在配置窗口内持续无可观测变化，则撤租、停止并报告 `FEEDBACK_STALLED`；
 - 过期/未来/乱序消息、非有限数值、错误 deadman、无租约和错误坐标系失败关闭；
 - 速度向量范数钳制、有限持续时间、六轴限位余量和 TCP 当前/预测工作空间检查；
@@ -106,5 +108,7 @@ python -m pytest .\teleop\bridge\tests
 ```
 
 测试只使用 `SimulatorBackend` 和本地临时目录，不连接真机。
+
+手机的 `sensor_timestamp_ms` 是设备启动时钟。桥接器能验证同一标定内严格递增和相邻间隔，但无法把它与服务端墙钟直接比较来独立证明样本的绝对年龄；手机端还必须用同源单调时钟检查传感器新鲜度，服务端则另用信封 `sent_at_ms` 检查网络消息时效。
 
 当前交付尚未完成 LM3-UP 真机停机距离/时延测试、Python 3.11 环境测试，以及官方 LeRobot v0.4.2 + FFmpeg 在 Windows 上的完整导出/回读端到端验证；这些项目通过前不得宣称真机或训练数据流水线已经验收。

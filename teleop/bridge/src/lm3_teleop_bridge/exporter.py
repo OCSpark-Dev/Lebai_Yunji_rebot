@@ -120,7 +120,7 @@ def action_velocity(frame: dict[str, Any]) -> list[float]:
     command = frame.get("command", {})
     if not isinstance(command, dict):
         raise ExportError("frame command field must be an object")
-    if command.get("type") not in (None, "motion.cartesian_velocity"):
+    if command.get("type") not in (None, "motion.cartesian_velocity", "pose.sample"):
         return [0.0] * 6
     linear = command.get("linear_mps", [0.0, 0.0, 0.0])
     angular = command.get("angular_rps", [0.0, 0.0, 0.0])

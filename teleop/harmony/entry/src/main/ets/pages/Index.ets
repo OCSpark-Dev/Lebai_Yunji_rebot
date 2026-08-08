@@ -63,6 +63,15 @@ struct Index {
     }
   }
 
+  private handlePoseDeadmanTouch(event: TouchEvent): void {
+    const touchId = this.changedTouchId(event);
+    if (event.type === TouchType.Down) {
+      this.client.setPoseDeadman(true, touchId);
+    } else if (event.type === TouchType.Up || event.type === TouchType.Cancel) {
+      this.client.setPoseDeadman(false, touchId);
+    }
+  }
+
   private handleAxisTouch(event: TouchEvent, axis: string, direction: number): void {
     const touchId = this.changedTouchId(event);
     if (event.type === TouchType.Down) {
@@ -98,8 +107,8 @@ struct Index {
       .height(48)
       .fontSize(18)
       .fontWeight(FontWeight.Bold)
-      .backgroundColor(this.snapshot.canCommand ? '#155EEF' : '#8A94A6')
-      .enabled(this.snapshot.canCommand)
+      .backgroundColor(this.snapshot.canCommand && !this.snapshot.poseDeadmanHeld ? '#155EEF' : '#8A94A6')
+      .enabled(this.snapshot.canCommand && !this.snapshot.poseDeadmanHeld)
       .onTouch((event: TouchEvent) => {
         this.handleAxisTouch(event, axis, direction);
       })
@@ -246,7 +255,7 @@ struct Index {
         .borderRadius(12)
 
         Column({ space: 10 }) {
-          Text('4. 低速笛卡尔点动')
+          Text('4. 触屏低速笛卡尔点动')
             .fontSize(19)
             .fontWeight(FontWeight.Bold)
           Row({ space: 8 }) {
@@ -272,7 +281,7 @@ struct Index {
             .fontSize(19)
             .fontWeight(FontWeight.Bold)
             .backgroundColor(this.snapshot.deadmanHeld ? '#B42318' : '#D92D20')
-            .enabled(this.snapshot.canCommand)
+            .enabled(this.snapshot.canCommand && !this.snapshot.poseDeadmanHeld)
             .onTouch((event: TouchEvent) => {
               this.handleDeadmanTouch(event);
             })
@@ -319,7 +328,67 @@ struct Index {
         .borderRadius(12)
 
         Column({ space: 10 }) {
-          Text('5. 夹爪')
+          Text('5. 手机陀螺仪姿态旋转（3DoF）')
+            .fontSize(19)
+            .fontWeight(FontWeight.Bold)
+          Text('必须检测到硬件 GYROSCOPE，再读取系统融合 ROTATION_VECTOR；只映射 TCP rx/ry/rz。XYZ 平移仍使用上方触屏轴键，绝不由 IMU 积分推算。')
+            .fontSize(12)
+            .fontColor('#B42318')
+          Row({ space: 10 }) {
+            Button('启用陀螺仪姿态')
+              .layoutWeight(1)
+              .enabled(!this.snapshot.poseSensorActive)
+              .backgroundColor('#155EEF')
+              .onClick(() => {
+                this.client.startPoseSensor();
+              })
+            Button('停止姿态传感器')
+              .layoutWeight(1)
+              .enabled(this.snapshot.poseSensorActive)
+              .backgroundColor('#475467')
+              .onClick(() => {
+                this.client.stopPoseSensor();
+              })
+          }
+          .width('100%')
+          Text(`传感器：${this.snapshot.poseSensorStatus}`)
+            .fontSize(13)
+          Text(`跟踪：${this.snapshot.poseTracking ? '稳定' : '不可用'}  精度：${this.snapshot.poseAccuracy}/3  ` +
+            `置信度：${this.snapshot.poseConfidence.toFixed(2)}  样本年龄：${this.snapshot.poseSampleAgeMs} ms`)
+            .fontSize(12)
+          Button('保持标准握持姿态并显式归零')
+            .width('100%')
+            .enabled(this.snapshot.canCalibratePose)
+            .backgroundColor(this.snapshot.poseCalibrated ? '#067647' : '#B54708')
+            .onClick(() => {
+              this.client.calibratePose();
+            })
+          Text(`归零：${this.snapshot.poseCalibrated ? '已完成' : '未完成'}  ID：${this.snapshot.poseCalibrationIdDisplay}`)
+            .fontSize(13)
+          Button(this.snapshot.poseDeadmanHeld ? '姿态 DEADMAN 按住中' : '持续按住姿态 DEADMAN')
+            .width('100%')
+            .height(64)
+            .fontSize(19)
+            .fontWeight(FontWeight.Bold)
+            .backgroundColor(this.snapshot.poseDeadmanHeld ? '#B42318' : '#D92D20')
+            .enabled(this.snapshot.canPoseCommand && !this.snapshot.deadmanHeld &&
+              this.snapshot.activeAxis === AxisName.NONE)
+            .onTouch((event: TouchEvent) => {
+              this.handlePoseDeadmanTouch(event);
+            })
+          Text(`最近旋转增量：${this.snapshot.poseDeltaText}`)
+            .fontSize(12)
+          Text('标准握持：屏幕朝上，手机顶部指向机器人底座 +X。手机 +X（屏幕向右）→ TCP -ry，+Y（手机顶部）→ TCP +rx，+Z（屏幕朝外）→ TCP +rz，即 [y,-x,z]。首帧仅 priming；松手、跳变、超过归零姿态 30°、样本陈旧、后台或断线立即停止。必须先在模拟器验向。')
+            .fontSize(12)
+            .fontColor('#B42318')
+        }
+        .width('100%')
+        .padding(14)
+        .backgroundColor('#FFFFFF')
+        .borderRadius(12)
+
+        Column({ space: 10 }) {
+          Text('6. 夹爪')
             .fontSize(19)
             .fontWeight(FontWeight.Bold)
           Row({ space: 10 }) {
@@ -349,7 +418,7 @@ struct Index {
         .borderRadius(12)
 
         Column({ space: 10 }) {
-          Text('6. VLA 示范录制')
+          Text('7. VLA 示范录制')
             .fontSize(19)
             .fontWeight(FontWeight.Bold)
           TextInput({ text: this.recordingTask, placeholder: '任务，例如：拿起红色方块放入左侧盒子' })

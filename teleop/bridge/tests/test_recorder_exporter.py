@@ -75,6 +75,17 @@ def test_episode_manifest_and_next_state_export_plan(tmp_path: Path) -> None:
     assert plan[0]["rows"][0]["teleop.timestamp_s"] == [0.0]
 
 
+def test_pose_sample_exports_executed_cartesian_velocity() -> None:
+    frame = _frame(1_000, 0.0)
+    frame["command"] = {
+        "type": "pose.sample",
+        "linear_mps": [0.0, 0.0, 0.0],
+        "angular_rps": [0.05, -0.1, 0.15],
+    }
+
+    assert exporter_module.action_velocity(frame) == [0.0, 0.0, 0.0, 0.05, -0.1, 0.15]
+
+
 def test_manifest_requires_complete_safe_file_set(tmp_path: Path) -> None:
     episode = tmp_path / "episode"
     episode.mkdir()

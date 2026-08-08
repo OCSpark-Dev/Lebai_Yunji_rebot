@@ -4,8 +4,8 @@
 
 当前已实现的范围（模拟后端、协议和结构性路径可在本机验证）：
 
-- Android 原生 Kotlin 触屏遥操客户端；
-- HarmonyOS 原生 ArkTS Stage 客户端；
+- Android 原生 Kotlin 客户端：系统 Rotation Vector 控制 TCP 姿态，触屏控制 XYZ 平移；
+- HarmonyOS 原生 ArkTS Stage 客户端：`SensorId.ROTATION_VECTOR` 控制 TCP 姿态，触屏控制 XYZ 平移；
 - 默认模拟后端的 Python WebSocket 安全桥；
 - 原始 episode、图像时间和 SHA-256 清单；
 - 使用官方 LeRobot API 的 LeRobot v3 导出器实现，目标格式供 LingBot-VLA 后训练使用；当前尚未完成官方 LeRobot v0.4.2 + FFmpeg 在 Windows 上的完整导出/回读 E2E；
@@ -32,7 +32,9 @@
 
 ```text
 Android / HarmonyOS
-  现场检查 + 1500 ms 长按解锁 + 按住式 DEADMAN
+  现场检查 + 1500 ms 长按解锁
+  Rotation Vector + 归零 + 按住式陀螺仪 DEADMAN
+  触屏轴键 + 原有平移 DEADMAN
                     |
                     | lm3-teleop.v1 / WebSocket / 20 Hz
                     v
@@ -103,10 +105,12 @@ Android 和 HarmonyOS 客户端具有相同的操作语义：
 2. 收到兼容的 `session.welcome` 和新鲜 `robot.state`；
 3. 确认底盘停止、工作区清空、急停可触达和工具固定；
 4. 长按 1500 ms 申请控制租约；
-5. 选择单一笛卡尔轴向，并持续按住 DEADMAN 点动；
-6. 松手、切后台、断线、状态过期或安全事件时立即本地清零并尽力发送停止。
+5. 旋转遥操要求手机实际存在硬件陀螺仪；客户端门禁通过后再点“陀螺仪归零”，保持当前手机姿态作为中位，然后持续按住陀螺仪 DEADMAN；
+6. 标准握持为屏幕朝上、手机顶部指向机器人基坐标 `+X`，固定映射 `[tcp_rx,tcp_ry,tcp_rz]=[phone_y,-phone_x,phone_z]`；首次使用必须在模拟器逐轴验向；
+7. 手机相邻姿态增量以最多 20 Hz 控制 TCP `Rx/Ry/Rz`；触屏轴键继续控制 `X/Y/Z`，两种运动输入不能并发；
+8. 松手、切后台、断线、传感器陈旧/跳变、状态过期或安全事件时立即本地清零并尽力发送停止。
 
-具体构建方式见 [`android/README.md`](android/README.md) 和 [`harmony/README.md`](harmony/README.md)。手机 6DoF `pose.sample` 只保留协议空间；完成两端独立标定、跳变检测、重定位处理和真机验收前不会发送或执行。
+具体构建方式见 [`android/README.md`](android/README.md) 和 [`harmony/README.md`](harmony/README.md)。`pose.sample` 已用于手机 3DoF 旋转增量，不包含手机平移。Rotation Vector 是系统融合姿态；它不能替代 ARKit/ARCore/WebXR 的空间位置跟踪，也不能被描述成完整 6DoF。
 
 ## 数据与 LingBot-VLA
 

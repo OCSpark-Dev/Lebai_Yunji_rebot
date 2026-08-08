@@ -1,8 +1,11 @@
 package com.lebai.lm3teleop.control
 
 import com.lebai.lm3teleop.core.AxisDirection
+import com.lebai.lm3teleop.core.CalibratedOrientation
 import com.lebai.lm3teleop.core.CartesianCommand
 import com.lebai.lm3teleop.core.GateContext
+import com.lebai.lm3teleop.core.PoseDeltaResult
+import com.lebai.lm3teleop.core.PoseDeltaTracker
 import com.lebai.lm3teleop.core.SafetyChecklist
 import com.lebai.lm3teleop.core.SafetyGate
 import com.lebai.lm3teleop.core.SpeedGear
@@ -17,6 +20,11 @@ import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
+
+enum class MotionInput {
+    TOUCH_AXIS,
+    PHONE_ORIENTATION,
+}
 
 data class ControllerSnapshot(
     val transportState: TransportState = TransportState.DISCONNECTED,
@@ -42,6 +50,7 @@ data class ControllerSnapshot(
     val leaseRemainingMs: Long = 0L,
     val pendingAcquire: Boolean = false,
     val deadmanActive: Boolean = false,
+    val motionInput: MotionInput? = null,
     val recordingActive: Boolean = false,
     val recordingPending: Boolean = false,
     val recordingDetail: String? = null,
@@ -52,6 +61,20 @@ data class ControllerSnapshot(
     val lastEvent: String = "等待连接",
     val lastEventSeverity: String = "info",
 )
+
+private sealed interface PendingMotion {
+    data class Cartesian(
+        val leaseId: String,
+        val command: CartesianCommand,
+    ) : PendingMotion
+
+    data class Pose(
+        val leaseId: String,
+        val calibrationId: String,
+        val sample: CalibratedOrientation,
+        val angularDeltaRad: com.lebai.lm3teleop.protocol.Vector3,
+    ) : PendingMotion
+}
 
 class TeleopController(
     private val clientId: String,
@@ -87,7 +110,14 @@ class TeleopController(
     private var checklist = SafetyChecklist()
     private var appForeground = true
     private var deadmanActive = false
+    private var motionInput: MotionInput? = null
     private var activeCommand: CartesianCommand? = null
+    private var activePose: CalibratedOrientation? = null
+    private var activePoseCalibrationId: String? = null
+    private var activePoseUpdatedAtMonotonicMs = 0L
+    private var lastPoseSentTimestampNs = -1L
+    private val poseDeltaTracker = PoseDeltaTracker()
+    private val pendingPoseSequences = linkedSetOf<Long>()
     private var motionFuture: ScheduledFuture<*>? = null
     private var heartbeatFuture: ScheduledFuture<*>? = null
     private var stateWatchdogFuture: ScheduledFuture<*>? = null
@@ -163,7 +193,9 @@ class TeleopController(
                     rejection = decision.reason
                 } else {
                     cancelMotionLoopLocked()
+                    clearPoseMotionLocked()
                     activeCommand = axis.command(gear)
+                    motionInput = MotionInput.TOUCH_AXIS
                     deadmanActive = true
                     lastEvent = "DEADMAN 按下：${axis.displayName} / ${gear.displayName}"
                     lastEventSeverity = "warning"
@@ -184,6 +216,76 @@ class TeleopController(
         return true
     }
 
+    fun startPoseMotion(calibrationId: String, sample: CalibratedOrientation): Boolean {
+        if (calibrationId.isBlank() || !poseSampleIsValid(sample)) {
+            setEvent("手机姿态样本无效，拒绝启动", "error")
+            return false
+        }
+        var rejection: String? = null
+        synchronized(motionSendLock) {
+            synchronized(lock) {
+                val decision = SafetyGate.canAct(gateContextLocked())
+                if (!decision.allowed) {
+                    rejection = decision.reason
+                } else {
+                    cancelMotionLoopLocked()
+                    activeCommand = null
+                    poseDeltaTracker.reset()
+                    activePose = sample
+                    activePoseCalibrationId = calibrationId
+                    activePoseUpdatedAtMonotonicMs = monotonicClock()
+                    lastPoseSentTimestampNs = -1L
+                    motionInput = MotionInput.PHONE_ORIENTATION
+                    deadmanActive = true
+                    lastEvent = "手机姿态 DEADMAN 按下；首帧仅用于增量归零"
+                    lastEventSeverity = "warning"
+                    motionFuture = scheduler.scheduleWithFixedDelay(
+                        ::sendMotionTick,
+                        0,
+                        MOTION_PERIOD_MS,
+                        TimeUnit.MILLISECONDS,
+                    )
+                }
+            }
+        }
+        if (rejection != null) {
+            setEvent(rejection!!, "warning")
+            return false
+        }
+        publish()
+        return true
+    }
+
+    fun updatePoseMotion(calibrationId: String, sample: CalibratedOrientation): Boolean {
+        if (calibrationId.isBlank() || !poseSampleIsValid(sample)) {
+            forceSafetyStop("orientation_invalid_sample", releaseLease = true, stopRecording = true)
+            return false
+        }
+        var failureReason: String? = null
+        val updated = synchronized(lock) {
+            when {
+                !deadmanActive || motionInput != MotionInput.PHONE_ORIENTATION -> false
+                calibrationId != activePoseCalibrationId -> {
+                    failureReason = "orientation_calibration_changed"
+                    false
+                }
+                sample.sensorTimestampNs <= (activePose?.sensorTimestampNs ?: -1L) -> {
+                    failureReason = "orientation_timestamp_not_increasing"
+                    false
+                }
+                else -> {
+                    activePose = sample
+                    activePoseUpdatedAtMonotonicMs = monotonicClock()
+                    true
+                }
+            }
+        }
+        if (failureReason != null) {
+            forceSafetyStop(failureReason!!, releaseLease = true, stopRecording = true)
+        }
+        return updated
+    }
+
     fun stopMotion(reason: String = "deadman_released") {
         val lease: String?
         val authenticated: Boolean
@@ -192,6 +294,8 @@ class TeleopController(
                 cancelMotionLoopLocked()
                 deadmanActive = false
                 activeCommand = null
+                motionInput = null
+                clearPoseMotionLocked()
                 lease = leaseId
                 authenticated = welcome != null && transportState == TransportState.OPEN
                 lastEvent = "已停止：$reason"
@@ -402,6 +506,9 @@ class TeleopController(
                 }
 
                 is ServerMessage.Ack -> {
+                    if (message.ackType == "pose.sample") {
+                        pendingPoseSequences.remove(message.ackSeq)
+                    }
                     recordingPending = if (message.ackType.startsWith("recording.")) false else recordingPending
                     lastEvent = buildString {
                         append(if (message.accepted) "ACK" else "拒绝")
@@ -414,16 +521,24 @@ class TeleopController(
                         message.clamped == true -> "warning"
                         else -> "info"
                     }
-                    if (!message.accepted && (message.ackType.startsWith("motion.") || message.ackType == "gripper.set")) {
+                    if (
+                        !message.accepted &&
+                        (
+                            message.ackType.startsWith("motion.") ||
+                                message.ackType == "pose.sample" ||
+                                message.ackType == "gripper.set"
+                            )
+                    ) {
                         forceStopReason = "command_rejected"
                         releaseLease = true
                     }
                 }
 
                 is ServerMessage.Error -> {
+                    val poseCommandFailed = message.ackSeq?.let(pendingPoseSequences::remove) == true
                     lastEvent = "${message.code}: ${message.message}"
                     lastEventSeverity = "error"
-                    if (!message.recoverable) {
+                    if (!message.recoverable || poseCommandFailed) {
                         forceStopReason = "nonrecoverable_error_${message.code}"
                         releaseLease = true
                     }
@@ -467,8 +582,8 @@ class TeleopController(
     private fun sendMotionTick() {
         synchronized(motionSendLock) {
             var failureReason: String? = null
-            val action = synchronized(lock) state@{
-                if (!deadmanActive || activeCommand == null) {
+            val action: PendingMotion? = synchronized(lock) state@{
+                if (!deadmanActive || motionInput == null) {
                     return@state null
                 }
                 val context = gateContextLocked()
@@ -485,7 +600,63 @@ class TeleopController(
                     }
                     null
                 } else {
-                    leaseId to activeCommand
+                    val lease = leaseId
+                    if (lease.isNullOrBlank()) {
+                        failureReason = "motion_gate_closed"
+                        null
+                    } else {
+                        when (motionInput) {
+                            MotionInput.TOUCH_AXIS -> {
+                                val command = activeCommand
+                                if (command == null) {
+                                    failureReason = "motion_gate_closed"
+                                    null
+                                } else {
+                                    PendingMotion.Cartesian(lease, command)
+                                }
+                            }
+
+                            MotionInput.PHONE_ORIENTATION -> {
+                                val nowMonotonicMs = monotonicClock()
+                                val sample = activePose
+                                val calibrationId = activePoseCalibrationId
+                                when {
+                                    sample == null || calibrationId.isNullOrBlank() -> {
+                                        failureReason = "orientation_sample_missing"
+                                        null
+                                    }
+
+                                    nowMonotonicMs < activePoseUpdatedAtMonotonicMs ||
+                                        nowMonotonicMs - activePoseUpdatedAtMonotonicMs > POSE_SAMPLE_MAX_AGE_MS -> {
+                                        failureReason = "orientation_sample_stale"
+                                        null
+                                    }
+
+                                    sample.sensorTimestampNs == lastPoseSentTimestampNs -> null
+                                    sample.sensorTimestampNs < lastPoseSentTimestampNs -> {
+                                        failureReason = "orientation_timestamp_not_increasing"
+                                        null
+                                    }
+
+                                    else -> when (val delta = poseDeltaTracker.preview(sample.relativeOrientation)) {
+                                        is PoseDeltaResult.Fault -> {
+                                            failureReason = "orientation_${delta.code.name.lowercase()}"
+                                            null
+                                        }
+
+                                        is PoseDeltaResult.Ready -> PendingMotion.Pose(
+                                            leaseId = lease,
+                                            calibrationId = calibrationId,
+                                            sample = sample,
+                                            angularDeltaRad = delta.angularDeltaRad,
+                                        )
+                                    }
+                                }
+                            }
+
+                            null -> null
+                        }
+                    }
                 }
             }
 
@@ -496,19 +667,58 @@ class TeleopController(
                 return
             }
 
-            val lease = action.first
-            val command = action.second
-            if (lease.isNullOrBlank() || command == null) {
-                forceSafetyStop("motion_gate_closed", releaseLease = true, stopRecording = true)
-                return
-            }
-            if (
-                socket.send(
-                    "motion.cartesian_velocity",
-                    ProtocolBodies.cartesianVelocity(lease, command.linear, command.angular),
-                ) == null && synchronized(lock) { transportState != TransportState.FAILED }
-            ) {
-                forceSafetyStop("motion_send_failed", releaseLease = true, stopRecording = true)
+            when (action) {
+                is PendingMotion.Cartesian -> {
+                    if (
+                        socket.send(
+                            "motion.cartesian_velocity",
+                            ProtocolBodies.cartesianVelocity(
+                                action.leaseId,
+                                action.command.linear,
+                                action.command.angular,
+                            ),
+                        ) == null && synchronized(lock) { transportState != TransportState.FAILED }
+                    ) {
+                        forceSafetyStop("motion_send_failed", releaseLease = true, stopRecording = true)
+                    }
+                }
+
+                is PendingMotion.Pose -> {
+                    val sequence = socket.send(
+                        "pose.sample",
+                        ProtocolBodies.poseSample(
+                            leaseId = action.leaseId,
+                            calibrationId = action.calibrationId,
+                            sensorTimestampMs = action.sample.sensorTimestampMs,
+                            confidence = action.sample.confidence,
+                            angularDeltaRad = action.angularDeltaRad,
+                        ),
+                    )
+                    if (sequence == null) {
+                        if (synchronized(lock) { transportState != TransportState.FAILED }) {
+                            forceSafetyStop("pose_send_failed", releaseLease = true, stopRecording = true)
+                        }
+                    } else {
+                        var ackBacklogExceeded = false
+                        synchronized(lock) {
+                            if (
+                                deadmanActive &&
+                                motionInput == MotionInput.PHONE_ORIENTATION &&
+                                activePoseCalibrationId == action.calibrationId
+                            ) {
+                                poseDeltaTracker.commit(action.sample.relativeOrientation)
+                                lastPoseSentTimestampNs = action.sample.sensorTimestampNs
+                                pendingPoseSequences += sequence
+                                ackBacklogExceeded = pendingPoseSequences.size > MAX_PENDING_POSE_ACKS
+                            }
+                        }
+                        if (ackBacklogExceeded) {
+                            forceSafetyStop("pose_ack_backlog", releaseLease = true, stopRecording = true)
+                        }
+                    }
+                }
+
+                null -> Unit
             }
         }
     }
@@ -545,6 +755,8 @@ class TeleopController(
                 cancelMotionLoopLocked()
                 deadmanActive = false
                 activeCommand = null
+                motionInput = null
+                clearPoseMotionLocked()
                 lease = leaseId
                 authenticated = welcome != null && transportState == TransportState.OPEN
                 recording = recordingActive || recordingPending
@@ -631,6 +843,14 @@ class TeleopController(
         motionFuture = null
     }
 
+    private fun clearPoseMotionLocked() {
+        activePose = null
+        activePoseCalibrationId = null
+        activePoseUpdatedAtMonotonicMs = 0L
+        lastPoseSentTimestampNs = -1L
+        poseDeltaTracker.reset()
+    }
+
     private fun cancelHeartbeatLocked() {
         heartbeatFuture?.cancel(false)
         heartbeatFuture = null
@@ -658,7 +878,10 @@ class TeleopController(
         welcomeReceivedAtMonotonicMs = null
         pendingAcquire = false
         deadmanActive = false
+        motionInput = null
         activeCommand = null
+        clearPoseMotionLocked()
+        pendingPoseSequences.clear()
         recordingActive = false
         recordingPending = false
         recordingDetail = null
@@ -732,6 +955,7 @@ class TeleopController(
             leaseRemainingMs = leaseRemainingMs,
             pendingAcquire = pendingAcquire,
             deadmanActive = deadmanActive,
+            motionInput = motionInput,
             recordingActive = recordingActive,
             recordingPending = recordingPending,
             recordingDetail = recordingDetail,
@@ -755,6 +979,19 @@ class TeleopController(
 
     companion object {
         private const val MOTION_PERIOD_MS = 50L
+        private const val POSE_SAMPLE_MAX_AGE_MS = 150L
+        private const val MAX_PENDING_POSE_ACKS = 32
+        private const val MINIMUM_POSE_CONFIDENCE = 0.8
         private const val STATE_WATCHDOG_PERIOD_MS = 100L
+    }
+
+    private fun poseSampleIsValid(sample: CalibratedOrientation): Boolean {
+        return sample.sensorTimestampNs > 0L && sample.sensorTimestampMs > 0L &&
+            sample.confidence.isFinite() &&
+            sample.confidence in MINIMUM_POSE_CONFIDENCE..1.0 &&
+            sample.relativeOrientation.normalizedOrNull() != null &&
+            sample.relativeRotationRad.x.isFinite() &&
+            sample.relativeRotationRad.y.isFinite() &&
+            sample.relativeRotationRad.z.isFinite()
     }
 }
