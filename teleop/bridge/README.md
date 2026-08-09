@@ -11,7 +11,8 @@
 - 真机快照优先用一次 `get_kin_data()` 合并读取关节位置、速度和 TCP；连续运动可复用从采样开始计龄不超过 `200 ms` 且不超过 watchdog 的最新快照。快照选择、机器人/包络校验、消息时效复核、租约/安全 epoch 复核与 `speedl` 位于同一次后端锁内，状态轮询不能插入其间；首条 `speedl` 尚未返回时也受独立在途 watchdog 约束，超时通过不等待普通后端锁的 stop 通道撤租停止。
 - `pose.sample` 已实现手机 Rotation Vector 的 TCP 旋转 3DoF 增量控制：只执行 `Rx/Ry/Rz`，强制 `X/Y/Z=0`；每个 `calibration_id` 首帧必须为零增量并只做 priming，非零 priming 失败关闭，切换标定时先停止旧运动；priming 帧同样占用 20 Hz motion token，不能靠反复换标定绕过限流；
 - 姿态消息只接受精确 v1 schema、`phone_calibrated/tcp_orientation`、`tracking`、`confidence>=0.8`；同一标定内的传感器间隔限 `20 ms` 到 `min(300 ms, watchdog_ms)`，单帧旋转增量范数限 `0.25 rad`，派生输入角速度范数限 `6.0 rad/s`，之后仍按安全配置把实际角速度钳制到默认 `0.15 rad/s`；
-- 连续有效的非零笛卡尔命令期间，若关节与 TCP 反馈在配置窗口内持续无可观测变化，则撤租、停止并报告 `FEEDBACK_STALLED`；
+- 连续有效的非零笛卡尔命令期间，累计达到可观测预期位移后仍没有与笛卡尔命令方向一致的 TCP 进度，也没有位移与反馈速度相互一致的关节进度，才撤租、停止并报告 `FEEDBACK_STALLED`；随机微抖、正交/反向噪声不算 TCP 进度，反复换向不能重置停滞窗口；
+- `pose.sample` 派生角速度范数低于 `1e-3 rad/s` 时只 ACK、续租并记录 `duration_ms=0`，不调用 `speedl` 或 `stop_move`；普通 `motion.cartesian_velocity` 的显式全零速度仍会下发 `speedl(0)`，保留松手停止的控制器侧冗余；
 - 会话建立后的过期/未来消息，以及所有乱序消息、非有限数值、错误 deadman、无租约和错误坐标系失败关闭；
 - 速度向量范数钳制、有限持续时间、六轴限位余量和 TCP 当前/预测工作空间检查；
 - 真机必须配置 TCP `Rx/Ry/Rz` 姿态中心和逐轴容差；授予租约、所有笛卡尔速度和每个 `pose.sample` 都按角度环绕后的最短距离检查当前姿态，非 priming 运动还检查按有限命令时长预测的姿态，越界返回 `ORIENTATION_LIMIT` 并走既有撤租/停止路径；
@@ -56,7 +57,7 @@ python -m venv .\tmp\lm3-teleop-venv
 
 ### 停止时序和现实边界
 
-硬件后端的状态、`speedl` 和夹爪等普通调用仍经过 `pylebai`，SDK/HTTP 调用可能因 Windows 调度、Python 线程、网络或控制器响应而延迟。桥接器因此把停止从普通后端锁中分离，并默认直接向控制器 `3031` 端口发送 `stop_move` JSON-RPC，软件 deadline 为 `200 ms`（由 `emergency_stop_port` 和 `emergency_stop_timeout_ms` 配置）；只有收到匹配 JSON-RPC 版本、请求 ID 和 `result` 的成功响应才视为确认。停止发生时还会使当前安全 epoch 失效；如果较早的 `speedl` 调用稍后才返回，桥接器会再次请求停止，且不会把旧命令重新标记为活动运动。
+硬件后端的状态、`speedl` 和夹爪等普通调用仍经过 `pylebai`，SDK/HTTP 调用可能因 Windows 调度、Python 线程、网络或控制器响应而延迟。桥接器因此把停止从普通后端锁中分离，并默认直接向控制器 `3031` 端口发送 `stop_move` JSON-RPC，软件 deadline 为 `200 ms`（由 `emergency_stop_port` 和 `emergency_stop_timeout_ms` 配置）；只有收到匹配 JSON-RPC 版本、请求 ID 和 `result` 的成功响应才视为确认。超时日志会区分 `connect`、`request`、`first_byte` 和 `body` 阶段，并记录总耗时与配置 deadline。停止发生时还会使当前安全 epoch 失效；如果较早的 `speedl` 调用稍后才返回，桥接器会再次请求停止，且不会把旧命令重新标记为活动运动。
 
 这仍然不是硬实时系统，也不是控制器的物理急停保证。真机使用必须同时保留有限的 `speedl` 持续时间、独立软件停止通道、可触达的物理急停和现场监护；不得把“200 ms 软件 deadline”解释为机械臂必然在 200 ms 内物理停住。
 
@@ -117,3 +118,5 @@ python -m pytest .\teleop\bridge\tests
 手机的 `sensor_timestamp_ms` 是设备启动时钟。桥接器能验证同一标定内严格递增和相邻间隔，但无法把它与服务端墙钟直接比较来独立证明样本的绝对年龄；手机端还必须用同源单调时钟检查传感器新鲜度。首个 `session.hello` 为了完成时钟偏差下的会话建立而豁免绝对时效校验，welcome 后服务端仍用信封 `sent_at_ms` 严格检查每条网络消息。
 
 2026-08-09 已完成 LM3-UP 真机的只读状态、Android 局域网握手、当前静止 TCP 小包络加载、控制租约授予和超过 60 秒续租验证。随后现场曾按下运动 DEADMAN；旧客户端发送速率高于真机后端吞吐，积压帧触发 `STALE_MESSAGE` 并安全撤租，因此没有完成实体运动方向验收。事后多次复核六轴速度均为 0、TCP 无变化，也没有发送夹爪动作。部署单槽 ACK credit 客户端和有界快照 Bridge 后，又在当前静止 TCP 小包络内完成超过 2 分钟的 Android 真机静止持租验证，期间没有 `STALE_MESSAGE`、`LEASE_REQUIRED`、watchdog、撤租或断线。当前交付仍未完成实体运动方向、真机停机距离/时延、夹爪、Python 3.11 环境，以及官方 LeRobot v0.4.2 + FFmpeg 在 Windows 上的完整导出/回读端到端验证；这些项目通过前不得宣称真机运动或训练数据流水线已经验收。
+
+后续极小姿态测试确认控制器收到 `speedl` 且 TCP 有小幅真实变化，但旧停滞判据随后误撤租；本版已加入姿态死区、累计方向性反馈进度、换向冻结反馈、显式零速冗余和租约恢复回归。新版尚未完成第二次非零真机复验，因为复验前现场控制器的控制页和 JSON-RPC 同时停止响应；Bridge 未在该状态下启动。

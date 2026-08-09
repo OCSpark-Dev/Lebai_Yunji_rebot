@@ -24,6 +24,30 @@ $sendStopMethod = ([regex]::Match(
   $client,
   '(?s)private sendStop\(reason: string\): void \{.*?(?=\r?\n  private sendEnvelope\()'
 )).Value
+$requestControlMethod = ([regex]::Match(
+  $client,
+  '(?s)requestControl\(\): void \{.*?(?=\r?\n  setSpeedProfile\()'
+)).Value
+$errorHandler = ([regex]::Match(
+  $client,
+  "(?s)\} else if \(envelope\.type === 'error'\) \{.*?(?=\r?\n    \} else if \(envelope\.type === 'safety\.event'\))"
+)).Value
+$handleControlStatusMethod = ([regex]::Match(
+  $client,
+  '(?s)private handleControlStatus\(.*?(?=\r?\n  private handleRobotState\()'
+)).Value
+$failClosedMethod = ([regex]::Match(
+  $client,
+  '(?s)private failClosed\(.*?(?=\r?\n  private failReceiveTransport\()'
+)).Value
+$clearLocalControlMethod = ([regex]::Match(
+  $client,
+  '(?s)private clearLocalControl\(\): void \{.*?(?=\r?\n  private resetConnectionState\()'
+)).Value
+$resetConnectionStateMethod = ([regex]::Match(
+  $client,
+  '(?s)private resetConnectionState\(\): void \{.*?(?=\r?\n  private stopPoseSensorInternal\()'
+)).Value
 
 # Keep this script ASCII-only so it parses consistently in Windows PowerShell 5.1.
 function Multiply-Quaternion([double[]]$left, [double[]]$right) {
@@ -71,6 +95,20 @@ $motionAckDeadlineExecutablePassed = (
   [Math]::Max(50, [Math]::Min(250, 40 - 50)) -eq 50
 ) -and (
   [Math]::Max(50, [Math]::Min(250, 1000 - 50)) -eq 250
+)
+$pendingAcquire = @{ active = $true; seq = 17 }
+$acquireErrorCorrelationExecutablePassed = (
+  $pendingAcquire.active -and $pendingAcquire.seq -eq 17
+) -and -not (
+  $pendingAcquire.active -and $pendingAcquire.seq -eq 18
+)
+$leaseFatalCodes = @('LEASE_REQUIRED', 'LEASE_EXPIRED')
+$leaseFatalErrorExecutablePassed = (
+  $leaseFatalCodes -contains 'LEASE_REQUIRED'
+) -and (
+  $leaseFatalCodes -contains 'LEASE_EXPIRED'
+) -and -not (
+  $leaseFatalCodes -contains 'BAD_COMMAND'
 )
 
 $checks = [ordered]@{}
@@ -197,6 +235,44 @@ $checks['stop uses canonical type'] = (
 )
 $checks['control acquire uses canonical type'] = (
   $client.Contains("sendEnvelope('control.acquire'")
+)
+$checks['control acquire tracks exact sequence and blocks duplicate requests'] = (
+  $client.Contains('private pendingAcquire: boolean = false;') -and
+  $client.Contains('private pendingAcquireSeq: number | undefined = undefined;') -and
+  $requestControlMethod.Contains('this.pendingAcquire = true;') -and
+  $requestControlMethod.Contains('this.pendingAcquireSeq = undefined;') -and
+  $requestControlMethod.Contains("const sequence = this.sendEnvelope('control.acquire'") -and
+  $requestControlMethod.Contains('this.pendingAcquireSeq = sequence;') -and
+  $requestControlMethod.Contains('if (!this.pendingAcquire)') -and
+  $client.Contains('!this.pendingAcquire;') -and
+  $acquireErrorCorrelationExecutablePassed
+)
+$checks['acquire error ack clears only the matching pending request'] = (
+  $errorHandler.Contains('body.ack_seq !== undefined && this.pendingAcquire') -and
+  $errorHandler.Contains('this.pendingAcquireSeq === undefined || this.pendingAcquireSeq === body.ack_seq') -and
+  $errorHandler.Contains('if (failedAcquire)') -and
+  $errorHandler.Contains('this.pendingAcquire = false;') -and
+  $errorHandler.Contains('this.pendingAcquireSeq = undefined;') -and
+  $acquireErrorCorrelationExecutablePassed
+)
+$checks['lease required and expired errors always fail closed'] = (
+  $errorHandler.Contains("body.code === 'LEASE_REQUIRED' || body.code === 'LEASE_EXPIRED'") -and
+  $errorHandler.Contains('if (leaseFatal)') -and
+  $errorHandler.Contains('this.failClosed(errorText, true);') -and
+  $leaseFatalErrorExecutablePassed
+)
+$checks['lease cleanup clears pending acquire motion credit and pose state'] = (
+  $handleControlStatusMethod.Contains('this.pendingAcquire = false;') -and
+  $handleControlStatusMethod.Contains('this.pendingAcquireSeq = undefined;') -and
+  $failClosedMethod.Contains('this.pendingAcquire = false;') -and
+  $failClosedMethod.Contains('this.pendingAcquireSeq = undefined;') -and
+  $failClosedMethod.Contains('this.sendStop(reason);') -and
+  $failClosedMethod.Contains('this.clearPoseCalibration();') -and
+  $clearLocalControlMethod.Contains('this.invalidateMotionCredit();') -and
+  $clearLocalControlMethod.Contains('this.pendingAcquire = false;') -and
+  $clearLocalControlMethod.Contains('this.pendingAcquireSeq = undefined;') -and
+  $clearLocalControlMethod.Contains('this.clearPoseCalibration();') -and
+  $resetConnectionStateMethod.Contains('this.clearLocalControl();')
 )
 $checks['gripper uses canonical type'] = (
   $client.Contains("sendEnvelope('gripper.set'")

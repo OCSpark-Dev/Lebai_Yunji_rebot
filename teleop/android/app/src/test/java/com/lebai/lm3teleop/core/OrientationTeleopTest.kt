@@ -138,6 +138,27 @@ class OrientationTeleopTest {
     }
 
     @Test
+    fun safetyResetRequiresExplicitRezeroBeforeTrackingResumes() {
+        val mapper = OrientationSafetyMapper()
+        val firstTimestamp = 1_000_000_000L
+        mapper.ingest(sample(UnitQuaternion.IDENTITY, firstTimestamp))
+        assertTrue(mapper.calibrate(firstTimestamp) is CalibrationResult.Success)
+        assertTrue(mapper.calibrated)
+
+        mapper.reset()
+        assertFalse(mapper.calibrated)
+
+        val freshTimestamp = firstTimestamp + 20_000_000L
+        assertTrue(
+            mapper.ingest(sample(UnitQuaternion.IDENTITY, freshTimestamp)) is
+                OrientationResult.AwaitingCalibration,
+        )
+        assertFalse(mapper.calibrated)
+        assertTrue(mapper.calibrate(freshTimestamp) is CalibrationResult.Success)
+        assertTrue(mapper.current(freshTimestamp) is OrientationResult.Tracking)
+    }
+
+    @Test
     fun timestampRegressionAndLongGapFailClosed() {
         val timestamp = 1_000_000_000L
         val regressionMapper = OrientationSafetyMapper()

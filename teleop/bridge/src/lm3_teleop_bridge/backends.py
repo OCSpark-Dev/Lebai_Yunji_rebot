@@ -324,7 +324,9 @@ def _direct_stop_move(host: str, port: int, timeout_ms: int) -> None:
     """
 
     timeout_s = timeout_ms / 1_000
-    deadline = time.monotonic() + timeout_s
+    started = time.monotonic()
+    deadline = started + timeout_s
+    stage = "connect"
     request = json.dumps(
         {"jsonrpc": "2.0", "id": 1, "method": "stop_move", "params": []},
         separators=(",", ":"),
@@ -332,6 +334,7 @@ def _direct_stop_move(host: str, port: int, timeout_ms: int) -> None:
     connection = http.client.HTTPConnection(host, port, timeout=timeout_s)
     try:
         connection.connect()
+        stage = "request"
         _set_connection_deadline(connection, deadline)
         connection.request(
             "POST",
@@ -339,8 +342,10 @@ def _direct_stop_move(host: str, port: int, timeout_ms: int) -> None:
             body=request.encode("utf-8"),
             headers={"Content-Type": "application/json"},
         )
+        stage = "first_byte"
         _set_connection_deadline(connection, deadline)
         response = connection.getresponse()
+        stage = "body"
         _set_connection_deadline(connection, deadline)
         payload = response.read(65_537)
         if time.monotonic() > deadline:
@@ -361,6 +366,13 @@ def _direct_stop_move(host: str, port: int, timeout_ms: int) -> None:
             or value.get("error") is not None
         ):
             raise RuntimeError("stop_move JSON-RPC returned an error response")
+    except TimeoutError as exc:
+        total_elapsed_ms = max(0.0, (time.monotonic() - started) * 1_000)
+        raise TimeoutError(
+            "stop_move JSON-RPC timed out "
+            f"stage={stage} total_elapsed_ms={total_elapsed_ms:.3f} "
+            f"configured_timeout_ms={timeout_ms}"
+        ) from exc
     finally:
         connection.close()
 

@@ -80,6 +80,9 @@ class _FrozenFeedbackBackend:
 
     def __init__(self) -> None:
         self.speed_calls = 0
+        self.speed_commands: list[
+            tuple[tuple[float, ...], tuple[float, ...], int]
+        ] = []
         self.stop_count = 0
         self.gripper_calls = 0
 
@@ -97,6 +100,9 @@ class _FrozenFeedbackBackend:
 
     def speed_cartesian(self, linear_mps, angular_rps, duration_ms: int) -> int:
         self.speed_calls += 1
+        self.speed_commands.append(
+            (tuple(linear_mps), tuple(angular_rps), duration_ms)
+        )
         return self.speed_calls
 
     def stop(self) -> None:
@@ -132,6 +138,37 @@ class _MutableFeedbackBackend(_FrozenFeedbackBackend):
             gripper_pct=50.0,
             base_locked=True,
         )
+
+
+class _OrthogonalNoiseBackend(_MutableFeedbackBackend):
+    def snapshot(self) -> RobotSnapshot:
+        self.tcp_pose["y"] += 5e-5
+        return super().snapshot()
+
+
+class _ReverseNoiseBackend(_MutableFeedbackBackend):
+    def snapshot(self) -> RobotSnapshot:
+        self.tcp_pose["x"] -= 5e-5
+        return super().snapshot()
+
+
+class _DirectionalProgressBackend(_MutableFeedbackBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.active_linear = (0.0, 0.0, 0.0)
+        self.active_angular = (0.0, 0.0, 0.0)
+
+    def snapshot(self) -> RobotSnapshot:
+        for axis, velocity in zip(("x", "y", "z"), self.active_linear, strict=True):
+            self.tcp_pose[axis] += velocity * 0.01
+        for axis, velocity in zip(("rx", "ry", "rz"), self.active_angular, strict=True):
+            self.tcp_pose[axis] += velocity * 0.01
+        return super().snapshot()
+
+    def speed_cartesian(self, linear_mps, angular_rps, duration_ms: int) -> int:
+        self.active_linear = tuple(linear_mps)
+        self.active_angular = tuple(angular_rps)
+        return super().speed_cartesian(linear_mps, angular_rps, duration_ms)
 
 
 class _BlockingSnapshotBackend(_MutableFeedbackBackend):
@@ -1598,6 +1635,257 @@ def test_continuous_motion_with_frozen_feedback_fails_closed(tmp_path: Path) -> 
     asyncio.run(_continuous_motion_with_frozen_feedback_fails_closed(tmp_path))
 
 
+@pytest.mark.parametrize(
+    "backend_type",
+    [_OrthogonalNoiseBackend, _ReverseNoiseBackend],
+    ids=["orthogonal", "reverse"],
+)
+def test_nondirectional_feedback_noise_does_not_mask_a_stall(
+    tmp_path: Path, backend_type
+) -> None:
+    async def scenario() -> None:
+        config = AppConfig(
+            server=ServerConfig(state_hz=20),
+            robot=RobotConfig(base_locked=True),
+            safety=SafetyConfig(feedback_stall_ms=150),
+            recording=RecordingConfig(root=tmp_path / "raw", fps=20),
+        )
+        backend = backend_type()
+        server = TeleopServer(config, TOKEN, backend=backend)
+        session, websocket, lease_id = _owned_session(server)
+        state_task = asyncio.create_task(server._state_loop())
+        try:
+            for seq in range(1, 10):
+                if server.leases.current is None:
+                    break
+                await server._motion_velocity(
+                    session,
+                    Envelope(
+                        "motion.cartesian_velocity",
+                        seq,
+                        int(time.time() * 1_000),
+                        {
+                            "lease_id": lease_id,
+                            "deadman": True,
+                            "frame": "base",
+                            "linear_mps": {"x": 0.01, "y": 0.0, "z": 0.0},
+                            "angular_rps": {"rx": 0.0, "ry": 0.0, "rz": 0.0},
+                            "duration_ms": 100,
+                        },
+                    ),
+                )
+                await asyncio.sleep(MOTION_COMMAND_TEST_SPACING_S)
+            await asyncio.wait_for(_wait_for_lease_release(server), timeout=1.0)
+        finally:
+            state_task.cancel()
+            await asyncio.gather(state_task, return_exceptions=True)
+
+        assert any(
+            message["type"] == "safety.event"
+            and message["body"]["code"] == "FEEDBACK_STALLED"
+            for message in _decoded_messages(websocket)
+        )
+
+    asyncio.run(scenario())
+
+
+def test_direction_changes_do_not_reset_frozen_feedback_stall_window(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = AppConfig(
+            server=ServerConfig(state_hz=20),
+            robot=RobotConfig(base_locked=True),
+            safety=SafetyConfig(feedback_stall_ms=150),
+            recording=RecordingConfig(root=tmp_path / "raw", fps=20),
+        )
+        backend = _FrozenFeedbackBackend()
+        server = TeleopServer(config, TOKEN, backend=backend)
+        session, websocket, lease_id = _owned_session(server)
+        state_task = asyncio.create_task(server._state_loop())
+        try:
+            for seq in range(1, 10):
+                if server.leases.current is None:
+                    break
+                direction = 1.0 if seq % 2 else -1.0
+                await server._motion_velocity(
+                    session,
+                    Envelope(
+                        "motion.cartesian_velocity",
+                        seq,
+                        int(time.time() * 1_000),
+                        {
+                            "lease_id": lease_id,
+                            "deadman": True,
+                            "frame": "base",
+                            "linear_mps": {"x": 0.0, "y": 0.0, "z": 0.0},
+                            "angular_rps": {
+                                "rx": 0.0,
+                                "ry": 0.0,
+                                "rz": 0.01 * direction,
+                            },
+                            "duration_ms": 100,
+                        },
+                    ),
+                )
+                await asyncio.sleep(MOTION_COMMAND_TEST_SPACING_S)
+            await asyncio.wait_for(_wait_for_lease_release(server), timeout=1.0)
+        finally:
+            state_task.cancel()
+            await asyncio.gather(state_task, return_exceptions=True)
+
+        assert any(
+            message["type"] == "safety.event"
+            and message["body"]["code"] == "FEEDBACK_STALLED"
+            for message in _decoded_messages(websocket)
+        )
+
+    asyncio.run(scenario())
+
+
+def test_direction_changes_with_directional_progress_keep_motion_alive(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = AppConfig(
+            server=ServerConfig(state_hz=20),
+            robot=RobotConfig(base_locked=True),
+            safety=SafetyConfig(feedback_stall_ms=150),
+            recording=RecordingConfig(root=tmp_path / "raw", fps=20),
+        )
+        backend = _DirectionalProgressBackend()
+        server = TeleopServer(config, TOKEN, backend=backend)
+        session, websocket, lease_id = _owned_session(server)
+        state_task = asyncio.create_task(server._state_loop())
+        directions = ((0.01, 0.0, 0.0), (0.0, 0.01, 0.0))
+        try:
+            for seq in range(1, 8):
+                angular = directions[(seq - 1) % len(directions)]
+                await server._motion_velocity(
+                    session,
+                    Envelope(
+                        "motion.cartesian_velocity",
+                        seq,
+                        int(time.time() * 1_000),
+                        {
+                            "lease_id": lease_id,
+                            "deadman": True,
+                            "frame": "base",
+                            "linear_mps": {"x": 0.0, "y": 0.0, "z": 0.0},
+                            "angular_rps": dict(
+                                zip(("rx", "ry", "rz"), angular, strict=True)
+                            ),
+                            "duration_ms": 100,
+                        },
+                    ),
+                )
+                await asyncio.sleep(MOTION_COMMAND_TEST_SPACING_S)
+        finally:
+            state_task.cancel()
+            await asyncio.gather(state_task, return_exceptions=True)
+
+        assert server.leases.current is not None
+        assert not any(
+            message["type"] == "safety.event"
+            and message["body"]["code"] == "FEEDBACK_STALLED"
+            for message in _decoded_messages(websocket)
+        )
+
+    asyncio.run(scenario())
+
+
+def test_directional_tcp_progress_keeps_continuous_motion_alive(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        config = AppConfig(
+            server=ServerConfig(state_hz=20),
+            robot=RobotConfig(base_locked=True),
+            safety=SafetyConfig(feedback_stall_ms=150),
+            recording=RecordingConfig(root=tmp_path / "raw", fps=20),
+        )
+        backend = _DirectionalProgressBackend()
+        server = TeleopServer(config, TOKEN, backend=backend)
+        session, websocket, lease_id = _owned_session(server)
+        state_task = asyncio.create_task(server._state_loop())
+        try:
+            for seq in range(1, 8):
+                await server._motion_velocity(
+                    session,
+                    Envelope(
+                        "motion.cartesian_velocity",
+                        seq,
+                        int(time.time() * 1_000),
+                        {
+                            "lease_id": lease_id,
+                            "deadman": True,
+                            "frame": "base",
+                            "linear_mps": {"x": 0.01, "y": 0.0, "z": 0.0},
+                            "angular_rps": {"rx": 0.0, "ry": 0.0, "rz": 0.0},
+                            "duration_ms": 100,
+                        },
+                    ),
+                )
+                await asyncio.sleep(MOTION_COMMAND_TEST_SPACING_S)
+        finally:
+            state_task.cancel()
+            await asyncio.gather(state_task, return_exceptions=True)
+
+        assert server.leases.current is not None
+        assert not any(
+            message["type"] == "safety.event"
+            and message["body"]["code"] == "FEEDBACK_STALLED"
+            for message in _decoded_messages(websocket)
+        )
+
+    asyncio.run(scenario())
+
+
+def test_eight_hz_commissioning_limits_still_detect_frozen_feedback(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        config = AppConfig(
+            server=ServerConfig(state_hz=8),
+            robot=RobotConfig(base_locked=True),
+            safety=SafetyConfig(
+                feedback_stall_ms=250,
+                max_linear_mps=0.002,
+                max_angular_rps=0.01,
+            ),
+            recording=RecordingConfig(root=tmp_path / "raw", fps=8),
+        )
+        backend = _FrozenFeedbackBackend()
+        server = TeleopServer(config, TOKEN, backend=backend)
+        session, _, lease_id = _owned_session(server)
+        state_task = asyncio.create_task(server._state_loop())
+        try:
+            for seq in range(1, 12):
+                if server.leases.current is None:
+                    break
+                await server._motion_velocity(
+                    session,
+                    Envelope(
+                        "motion.cartesian_velocity",
+                        seq,
+                        int(time.time() * 1_000),
+                        {
+                            "lease_id": lease_id,
+                            "deadman": True,
+                            "frame": "base",
+                            "linear_mps": {"x": 0.002, "y": 0.0, "z": 0.0},
+                            "angular_rps": {"rx": 0.0, "ry": 0.0, "rz": 0.0},
+                            "duration_ms": 150,
+                        },
+                    ),
+                )
+                await asyncio.sleep(MOTION_COMMAND_TEST_SPACING_S)
+            await asyncio.wait_for(_wait_for_lease_release(server), timeout=1.5)
+        finally:
+            state_task.cancel()
+            await asyncio.gather(state_task, return_exceptions=True)
+
+        assert backend.speed_calls >= 2
+
+    asyncio.run(scenario())
+
+
 def test_equivalent_euler_wrap_feedback_does_not_refresh_stall_clock(tmp_path: Path) -> None:
     config = AppConfig(
         robot=RobotConfig(base_locked=True),
@@ -2526,6 +2814,97 @@ def test_pose_sample_accepts_interval_up_to_three_hundred_ms_watchdog(tmp_path: 
         )
         assert ack["body"]["accepted"] is True
         assert server._last_command["sensor_interval_ms"] == 300
+
+    asyncio.run(scenario())
+
+
+def test_pose_small_angular_velocity_is_deadbanded_without_speedl(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        config = AppConfig(
+            robot=RobotConfig(base_locked=True),
+            recording=RecordingConfig(root=tmp_path / "raw", fps=20),
+        )
+        backend = _FrozenFeedbackBackend()
+        server = TeleopServer(config, TOKEN, backend=backend)
+        session, websocket, lease_id = _owned_session(server)
+        await _prime_pose(server, session, lease_id)
+        websocket.sent.clear()
+        await asyncio.sleep(MOTION_COMMAND_TEST_SPACING_S)
+
+        await server._handle_text(
+            session,
+            _message(
+                "pose.sample",
+                2,
+                _pose_body(
+                    lease_id,
+                    sensor_timestamp_ms=1_100,
+                    angular_delta_rad=(5e-5, 0.0, 0.0),
+                ),
+            ),
+        )
+
+        ack = next(
+            message
+            for message in _decoded_messages(websocket)
+            if message["type"] == "ack"
+        )
+        assert ack["body"]["accepted"] is True
+        assert ack["body"]["clamped"] is True
+        assert "deadband" in ack["body"]["detail"]
+        assert backend.speed_calls == 0
+        assert backend.stop_count == 0
+        assert server.leases.current is not None
+        assert server._last_command["deadbanded"] is True
+        assert server._last_command["duration_ms"] == 0
+        assert server._last_command["angular_rps"] == [0.0, 0.0, 0.0]
+        assert server._feedback_motion_expected is False
+
+    asyncio.run(scenario())
+
+
+def test_explicit_zero_cartesian_velocity_reaches_speedl_as_stop_redundancy(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = AppConfig(
+            robot=RobotConfig(base_locked=True),
+            recording=RecordingConfig(root=tmp_path / "raw", fps=20),
+        )
+        backend = _FrozenFeedbackBackend()
+        server = TeleopServer(config, TOKEN, backend=backend)
+        session, _, lease_id = _owned_session(server)
+
+        def velocity_envelope(seq: int, x: float) -> Envelope:
+            return Envelope(
+                "motion.cartesian_velocity",
+                seq,
+                int(time.time() * 1_000),
+                {
+                    "lease_id": lease_id,
+                    "deadman": True,
+                    "frame": "base",
+                    "linear_mps": {"x": x, "y": 0.0, "z": 0.0},
+                    "angular_rps": {"rx": 0.0, "ry": 0.0, "rz": 0.0},
+                    "duration_ms": 100,
+                },
+            )
+
+        await server._motion_velocity(session, velocity_envelope(1, 0.01))
+        await asyncio.sleep(MOTION_COMMAND_TEST_SPACING_S)
+        await server._motion_velocity(session, velocity_envelope(2, 0.0))
+
+        assert backend.speed_calls == 2
+        assert backend.speed_commands[-1] == (
+            (0.0, 0.0, 0.0),
+            (0.0, 0.0, 0.0),
+            100,
+        )
+        assert backend.stop_count == 0
+        assert server._last_command["duration_ms"] == 100
+        assert server._last_command["motion_id"] == 2
+        assert server._feedback_motion_expected is False
+        assert server.leases.current is not None
 
     asyncio.run(scenario())
 

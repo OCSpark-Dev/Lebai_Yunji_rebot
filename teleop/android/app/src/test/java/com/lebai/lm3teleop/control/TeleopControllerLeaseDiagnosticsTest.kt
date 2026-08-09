@@ -8,13 +8,138 @@ import com.lebai.lm3teleop.network.TransportState
 import com.lebai.lm3teleop.protocol.ServerMessage
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicLong
 
 class TeleopControllerLeaseDiagnosticsTest {
+    @Test
+    fun acquireErrorClearsPendingStateAndAllowsImmediateRetry() {
+        val scheduler = Executors.newSingleThreadScheduledExecutor()
+        val snapshots = CopyOnWriteArrayList<ControllerSnapshot>()
+        lateinit var transport: CapturingTransport
+        val controller = TeleopController(
+            clientId = "client-1",
+            appVersion = "test",
+            listener = snapshots::add,
+            monotonicClock = { 1_000L },
+            scheduler = scheduler,
+            transportFactory = { listener ->
+                CapturingTransport(listener).also { transport = it }
+            },
+        )
+
+        try {
+            establishReadySession(controller, transport.listener)
+            assertTrue(controller.requestControl())
+            val acquireSequence = transport.frames.single { it.second == "control.acquire" }.first
+            assertTrue(snapshots.last().pendingAcquire)
+
+            transport.listener.onServerMessage(
+                ServerMessage.Error(
+                    seq = 2L,
+                    sentAtMs = 5_010L,
+                    ackSeq = acquireSequence,
+                    code = "STALE_MESSAGE",
+                    message = "message is older than the configured limit",
+                    recoverable = true,
+                ),
+            )
+
+            assertFalse(snapshots.last().pendingAcquire)
+            assertTrue(snapshots.last().canRequestControl)
+            assertEquals("STALE_MESSAGE: message is older than the configured limit", snapshots.last().lastEvent)
+            assertTrue(controller.requestControl())
+            assertEquals(2, transport.frames.count { it.second == "control.acquire" })
+        } finally {
+            scheduler.shutdownNow()
+        }
+    }
+
+    @Test
+    fun leaseRequiredAndExpiredAlwaysFailClosedWithoutMatchingMotionAck() {
+        for (errorCode in listOf("LEASE_REQUIRED", "LEASE_EXPIRED")) {
+            val scheduler = Executors.newSingleThreadScheduledExecutor()
+            val snapshots = CopyOnWriteArrayList<ControllerSnapshot>()
+            lateinit var transport: CapturingTransport
+            val controller = TeleopController(
+                clientId = "client-1",
+                appVersion = "test",
+                listener = snapshots::add,
+                monotonicClock = { 1_000L },
+                scheduler = scheduler,
+                transportFactory = { listener ->
+                    CapturingTransport(listener).also { transport = it }
+                },
+            )
+
+            try {
+                establishLease(controller, transport.listener)
+                transport.listener.onServerMessage(
+                    ServerMessage.Error(
+                        seq = 3L,
+                        sentAtMs = 5_010L,
+                        ackSeq = 999L,
+                        code = errorCode,
+                        message = "valid control lease required",
+                        recoverable = true,
+                    ),
+                )
+
+                val failed = snapshots.last()
+                assertNull(failed.leaseId)
+                assertFalse(failed.deadmanActive)
+                assertFalse(failed.pendingAcquire)
+                assertTrue("$errorCode should allow reacquire", failed.canRequestControl)
+                assertTrue(controller.requestControl())
+            } finally {
+                scheduler.shutdownNow()
+            }
+        }
+    }
+
+    @Test
+    fun backendErrorFailsClosedAndLeavesReadySessionReacquirable() {
+        val scheduler = Executors.newSingleThreadScheduledExecutor()
+        val snapshots = CopyOnWriteArrayList<ControllerSnapshot>()
+        lateinit var transport: CapturingTransport
+        val controller = TeleopController(
+            clientId = "client-1",
+            appVersion = "test",
+            listener = snapshots::add,
+            monotonicClock = { 1_000L },
+            scheduler = scheduler,
+            transportFactory = { listener ->
+                CapturingTransport(listener).also { transport = it }
+            },
+        )
+
+        try {
+            establishLease(controller, transport.listener)
+            transport.listener.onServerMessage(
+                ServerMessage.Error(
+                    seq = 3L,
+                    sentAtMs = 5_010L,
+                    ackSeq = 999L,
+                    code = "BACKEND_ERROR",
+                    message = "backend operation failed",
+                    recoverable = false,
+                ),
+            )
+
+            assertNull(snapshots.last().leaseId)
+            assertFalse(snapshots.last().deadmanActive)
+            assertTrue(snapshots.last().canRequestControl)
+            assertTrue(controller.requestControl())
+        } finally {
+            scheduler.shutdownNow()
+        }
+    }
+
     @Test
     fun heartbeatAckAfter150msDoesNotHideControlRevocationReason() {
         val scheduler = Executors.newSingleThreadScheduledExecutor()
@@ -246,6 +371,21 @@ class TeleopControllerLeaseDiagnosticsTest {
     }
 
     private fun establishLease(controller: TeleopController, listener: TeleopTransportListener) {
+        establishReadySession(controller, listener)
+        listener.onServerMessage(
+            ServerMessage.ControlStatus(
+                seq = 2L,
+                sentAtMs = 5_002L,
+                granted = true,
+                leaseId = "lease-1",
+                ownerClientId = "client-1",
+                expiresAtMs = 7_000L,
+                reason = "granted",
+            ),
+        )
+    }
+
+    private fun establishReadySession(controller: TeleopController, listener: TeleopTransportListener) {
         controller.connect("wss://robot.example.com/teleop", "phone")
         listener.onTransportState(TransportState.OPEN, "open")
         listener.onServerMessage(
@@ -284,27 +424,21 @@ class TeleopControllerLeaseDiagnosticsTest {
                 toolSecure = true,
             ),
         )
-        listener.onServerMessage(
-            ServerMessage.ControlStatus(
-                seq = 2L,
-                sentAtMs = 5_002L,
-                granted = true,
-                leaseId = "lease-1",
-                ownerClientId = "client-1",
-                expiresAtMs = 7_000L,
-                reason = "granted",
-            ),
-        )
     }
 
     private class CapturingTransport(
         val listener: TeleopTransportListener,
     ) : TeleopTransport {
         private val sequence = AtomicLong(0L)
+        val frames = CopyOnWriteArrayList<Triple<Long, String, JSONObject>>()
 
         override fun connect(config: ConnectionConfig) = Unit
 
-        override fun send(type: String, body: JSONObject): Long = sequence.getAndIncrement()
+        override fun send(type: String, body: JSONObject): Long {
+            val sentSequence = sequence.getAndIncrement()
+            frames += Triple(sentSequence, type, JSONObject(body.toString()))
+            return sentSequence
+        }
 
         override fun closeGracefully(reason: String) = Unit
 

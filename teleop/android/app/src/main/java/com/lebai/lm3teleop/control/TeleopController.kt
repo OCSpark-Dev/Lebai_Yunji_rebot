@@ -118,6 +118,7 @@ class TeleopController(
     private var serverTimeAtWelcomeMs: Long? = null
     private var welcomeReceivedAtMonotonicMs: Long? = null
     private var pendingAcquire = false
+    private var pendingAcquireSeq: Long? = null
     private var checklist = SafetyChecklist()
     private var appForeground = true
     private var deadmanActive = false
@@ -180,14 +181,29 @@ class TeleopController(
         }
         val body = synchronized(lock) {
             pendingAcquire = true
+            pendingAcquireSeq = null
             ProtocolBodies.controlAcquire(checklist.toProtocol())
         }
-        if (socket.send("control.acquire", body) == null) {
-            synchronized(lock) { pendingAcquire = false }
+        val sequence = socket.send("control.acquire", body)
+        if (sequence == null) {
+            synchronized(lock) {
+                pendingAcquire = false
+                pendingAcquireSeq = null
+            }
             setEvent("control.acquire 发送失败", "error")
             return false
         }
-        setEvent("已申请 2 秒控制租约，等待服务端授权", "info")
+        val stillPending = synchronized(lock) {
+            if (pendingAcquire) {
+                pendingAcquireSeq = sequence
+                true
+            } else {
+                false
+            }
+        }
+        if (stillPending) {
+            setEvent("已申请 2 秒控制租约，等待服务端授权", "info")
+        }
         return true
     }
 
@@ -462,6 +478,7 @@ class TeleopController(
 
                 is ServerMessage.ControlStatus -> {
                     pendingAcquire = false
+                    pendingAcquireSeq = null
                     val nowMonotonicMs = monotonicClock()
                     val deadlineMonotonicMs = leaseDeadlineForServerExpiryLocked(
                         expiresAtServerMs = message.expiresAtMs,
@@ -590,6 +607,14 @@ class TeleopController(
                             pendingMotionAck = null
                         }
                     }
+                    val failedAcquire = message.ackSeq?.let { ackSeq ->
+                        pendingAcquire && (pendingAcquireSeq == null || pendingAcquireSeq == ackSeq)
+                    } == true
+                    if (failedAcquire) {
+                        pendingAcquire = false
+                        pendingAcquireSeq = null
+                    }
+                    val leaseFatal = message.code in LEASE_FATAL_ERROR_CODES
                     lastEvent = "${message.code}: ${message.message}"
                     lastEventSeverity = "error"
                     if (welcome == null && message.seq == 0L) {
@@ -599,11 +624,12 @@ class TeleopController(
                         transportDetail = lastEvent
                         lastEvent = "$lastEvent；连接已强制关闭"
                         resetSessionLocked()
-                    } else if (
-                        !message.recoverable ||
-                        failedMotion?.generation == motionGeneration
-                    ) {
-                        forceStopReason = "nonrecoverable_error_${message.code}"
+                    } else if (leaseFatal || !message.recoverable || failedMotion?.generation == motionGeneration) {
+                        forceStopReason = if (leaseFatal) {
+                            "lease_error_${message.code.lowercase()}"
+                        } else {
+                            "nonrecoverable_error_${message.code}"
+                        }
                         releaseLease = true
                         preserveServerEvent = true
                     }
@@ -890,6 +916,7 @@ class TeleopController(
                     leaseExpiresAtMs = 0L
                     leaseDeadlineMonotonicMs = 0L
                     pendingAcquire = false
+                    pendingAcquireSeq = null
                 }
                 if (stopRecording) {
                     recordingActive = false
@@ -1009,6 +1036,7 @@ class TeleopController(
         serverTimeAtWelcomeMs = null
         welcomeReceivedAtMonotonicMs = null
         pendingAcquire = false
+        pendingAcquireSeq = null
         deadmanActive = false
         motionInput = null
         activeCommand = null
@@ -1118,6 +1146,7 @@ class TeleopController(
         private const val MIN_MOTION_ACK_TIMEOUT_MS = 50L
         private const val MAX_MOTION_ACK_TIMEOUT_MS = 250L
         private val CLEANUP_ACK_TYPES = setOf("motion.stop", "control.release", "recording.stop")
+        private val LEASE_FATAL_ERROR_CODES = setOf("LEASE_REQUIRED", "LEASE_EXPIRED")
         private val STICKY_EVENT_SEVERITIES = setOf("warning", "warn", "error", "critical", "fatal")
     }
 

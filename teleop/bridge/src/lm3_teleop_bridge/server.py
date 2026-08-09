@@ -46,6 +46,13 @@ from .safety import (
 
 LOGGER = logging.getLogger("lm3_teleop_bridge")
 FEEDBACK_CHANGE_EPSILON = 1e-6
+POSE_ANGULAR_DEADBAND_RPS = 1e-3
+FEEDBACK_MIN_LINEAR_PROGRESS_M = 2e-5
+FEEDBACK_MIN_ANGULAR_PROGRESS_RAD = 2e-5
+FEEDBACK_MIN_JOINT_PROGRESS_RAD = 2e-5
+FEEDBACK_OBSERVABILITY_FACTOR = 2.0
+FEEDBACK_JOINT_VELOCITY_EPSILON_RAD_S = 1e-5
+FEEDBACK_DIRECTION_COSINE_MIN = 0.5
 POSE_MIN_CONFIDENCE = 0.8
 POSE_MIN_INTERVAL_MS = 20
 POSE_MAX_INTERVAL_MS = 300
@@ -95,6 +102,20 @@ class ClientSession:
 class PoseSampleState:
     calibration_id: str
     last_sensor_timestamp_ms: int
+
+
+@dataclass(slots=True)
+class FeedbackMotionState:
+    started_monotonic: float
+    last_accounted_monotonic: float
+    command_expires_monotonic: float
+    linear_mps: tuple[float, float, float]
+    angular_rps: tuple[float, float, float]
+    baseline_joint_position_rad: tuple[float, ...]
+    baseline_tcp_xyz: tuple[float, float, float]
+    baseline_tcp_orientation_rad: tuple[float, float, float]
+    expected_linear_m: float = 0.0
+    expected_angular_rad: float = 0.0
 
 
 class TeleopServer:
@@ -157,6 +178,7 @@ class TeleopServer:
         self._motion_command_expires_monotonic = 0.0
         self._last_feedback_change_monotonic = time.monotonic()
         self._feedback_signature: tuple[float, ...] | None = None
+        self._feedback_motion_state: FeedbackMotionState | None = None
         self._latest_snapshot: RobotSnapshot | None = None
         self._latest_snapshot_started_monotonic: float | None = None
         self._motion_inflight_generation = 0
@@ -889,6 +911,7 @@ class TeleopServer:
             linear=(0.0, 0.0, 0.0),
             angular=input_angular,
             requested_duration=interval_ms,
+            apply_pose_deadband=True,
             audit={
                 "priming": False,
                 "frame": "phone_calibrated",
@@ -916,6 +939,7 @@ class TeleopServer:
         linear: tuple[float, float, float],
         angular: tuple[float, float, float],
         requested_duration: int,
+        apply_pose_deadband: bool = False,
         audit: dict[str, Any] | None = None,
     ) -> None:
         command_deadline_monotonic = (
@@ -929,7 +953,17 @@ class TeleopServer:
             min(requested_duration, self.config.safety.max_command_duration_ms),
         )
         linear, angular, velocity_clamped = clamp_twist(linear, angular, self.config.safety)
-        clamped = velocity_clamped or duration != requested_duration
+        pose_deadbanded = False
+        if apply_pose_deadband and _vector_norm(angular) < POSE_ANGULAR_DEADBAND_RPS:
+            pose_deadbanded = True
+            angular = (0.0, 0.0, 0.0)
+        nonzero_motion = any(component != 0.0 for component in (*linear, *angular))
+        # Explicit zero cartesian velocity is a protocol-level stop redundancy and
+        # must still reach speedl.  Pose deadband frames are the sole exception:
+        # they only refresh the lease/watchdog without touching the controller.
+        execute_speed_command = not pose_deadbanded
+        clamped = velocity_clamped or duration != requested_duration or pose_deadbanded
+        motion_id: int | None = None
         async with self._backend_lock:
             snapshot = self._fresh_motion_snapshot_locked()
             if snapshot is None:
@@ -978,31 +1012,27 @@ class TeleopServer:
                     "current or predicted TCP orientation is outside the configured envelope",
                 )
             self._assert_command_current(session, lease.lease_id, command_epoch)
-            inflight_token = self._begin_motion_inflight(command_deadline_monotonic)
-            try:
-                motion_id = await asyncio.to_thread(
-                    self.backend.speed_cartesian, linear, angular, duration
-                )
-            finally:
-                self._finish_motion_inflight(inflight_token)
+            if execute_speed_command:
+                inflight_token = self._begin_motion_inflight(command_deadline_monotonic)
+                try:
+                    motion_id = await asyncio.to_thread(
+                        self.backend.speed_cartesian, linear, angular, duration
+                    )
+                finally:
+                    self._finish_motion_inflight(inflight_token)
         if not self._command_is_current(session, lease.lease_id, command_epoch):
             await self._execute_stop()
             raise ProtocolError(
                 "LEASE_REQUIRED",
                 "motion command was cancelled by a newer safety stop or lease change",
             )
-        if motion_id <= 0:
+        if execute_speed_command and (motion_id is None or motion_id <= 0):
             raise RuntimeError("Lebai speedl did not return a positive motion id")
         now_mono = time.monotonic()
-        feedback_motion_expected = any(
-            abs(component) > FEEDBACK_CHANGE_EPSILON for component in (*linear, *angular)
-        )
-        if feedback_motion_expected and not self._feedback_motion_expected:
-            self._last_feedback_change_monotonic = now_mono
-        self._feedback_motion_expected = feedback_motion_expected
-        self._motion_command_expires_monotonic = (
-            now_mono + duration / 1_000 if feedback_motion_expected else 0.0
-        )
+        if nonzero_motion:
+            self._set_feedback_motion_command(linear, angular, duration, now_mono)
+        else:
+            self._clear_feedback_motion_tracking()
         self._motion_active = True
         self._last_valid_motion = now_mono
         received_at_ms = _wall_ms()
@@ -1015,14 +1045,26 @@ class TeleopServer:
             "deadman": True,
             "linear_mps": list(linear),
             "angular_rps": list(angular),
-            "duration_ms": duration,
+            "duration_ms": duration if execute_speed_command else 0,
             "clamped": clamped,
-            "motion_id": motion_id,
+            "deadbanded": pose_deadbanded,
         }
+        if motion_id is not None:
+            last_command["motion_id"] = motion_id
         if audit:
             last_command.update(audit)
         self._last_command = last_command
-        await self._send_ack(session, envelope, accepted=True, clamped=clamped)
+        await self._send_ack(
+            session,
+            envelope,
+            accepted=True,
+            clamped=clamped,
+            detail=(
+                "pose angular velocity was inside the server deadband; no motion executed"
+                if pose_deadbanded
+                else ""
+            ),
+        )
         await self._maybe_send_lease_status(session, force=False)
 
     async def _gripper(self, session: ClientSession, envelope: Envelope) -> None:
@@ -1399,16 +1441,10 @@ class TeleopServer:
                             stop_recording=True,
                         )
                 now_mono = time.monotonic()
-                state_period_s = 1.0 / self.config.server.state_hz
-                if (
-                    self._feedback_motion_expected
-                    and now_mono <= self._motion_command_expires_monotonic + state_period_s
-                    and (now_mono - self._last_feedback_change_monotonic) * 1_000
-                    > self.config.safety.feedback_stall_ms
-                ):
+                if self._feedback_stalled(now_mono):
                     await self._safe_stop(
                         "FEEDBACK_STALLED",
-                        "joint and TCP feedback did not change during continuous non-zero motion",
+                        "joint and TCP feedback made no directional progress during observable continuous motion",
                         revoke=True,
                         stop_recording=True,
                     )
@@ -1509,18 +1545,174 @@ class TeleopServer:
     def _invalidate_commands(self) -> None:
         self._safety_epoch += 1
         self._motion_active = False
-        self._feedback_motion_expected = False
-        self._motion_command_expires_monotonic = 0.0
+        self._clear_feedback_motion_tracking()
         self._motion_inflight_generation += 1
         self._motion_inflight_token = None
         self._motion_inflight_deadline_monotonic = 0.0
         self._pose_states.clear()
+
+    def _clear_feedback_motion_tracking(self) -> None:
+        self._feedback_motion_expected = False
+        self._motion_command_expires_monotonic = 0.0
+        self._feedback_motion_state = None
+
+    def _set_feedback_motion_command(
+        self,
+        linear: tuple[float, float, float],
+        angular: tuple[float, float, float],
+        duration_ms: int,
+        now_monotonic: float,
+    ) -> None:
+        snapshot = self._latest_snapshot
+        if snapshot is None:
+            self._clear_feedback_motion_tracking()
+            return
+        expires_monotonic = now_monotonic + duration_ms / 1_000
+        previous = self._feedback_motion_state
+        state_period_s = 1.0 / self.config.server.state_hz
+        temporally_continuous = (
+            previous is not None
+            and now_monotonic <= previous.command_expires_monotonic + state_period_s
+        )
+        if temporally_continuous and previous is not None:
+            self._advance_feedback_expected(previous, now_monotonic)
+            same_direction = _same_motion_direction(
+                previous.linear_mps, linear
+            ) and _same_motion_direction(previous.angular_rps, angular)
+            if not same_direction:
+                # A direction change needs a fresh directional baseline, but it
+                # is not evidence of feedback progress and must not restart the
+                # stall window.  Expected travel remains accumulated so rapid
+                # reversals cannot indefinitely hide frozen feedback.
+                previous.baseline_joint_position_rad = tuple(snapshot.joint_position_rad)
+                previous.baseline_tcp_xyz = tuple(
+                    snapshot.tcp_pose[axis] for axis in ("x", "y", "z")
+                )
+                previous.baseline_tcp_orientation_rad = tuple(
+                    snapshot.tcp_pose[axis] for axis in ("rx", "ry", "rz")
+                )
+            previous.linear_mps = linear
+            previous.angular_rps = angular
+            previous.last_accounted_monotonic = now_monotonic
+            previous.command_expires_monotonic = expires_monotonic
+        else:
+            self._feedback_motion_state = FeedbackMotionState(
+                started_monotonic=now_monotonic,
+                last_accounted_monotonic=now_monotonic,
+                command_expires_monotonic=expires_monotonic,
+                linear_mps=linear,
+                angular_rps=angular,
+                baseline_joint_position_rad=tuple(snapshot.joint_position_rad),
+                baseline_tcp_xyz=tuple(snapshot.tcp_pose[axis] for axis in ("x", "y", "z")),
+                baseline_tcp_orientation_rad=tuple(
+                    snapshot.tcp_pose[axis] for axis in ("rx", "ry", "rz")
+                ),
+            )
+            self._last_feedback_change_monotonic = now_monotonic
+        self._feedback_motion_expected = True
+        self._motion_command_expires_monotonic = expires_monotonic
+
+    @staticmethod
+    def _advance_feedback_expected(state: FeedbackMotionState, now_monotonic: float) -> None:
+        active_until = min(now_monotonic, state.command_expires_monotonic)
+        if active_until <= state.last_accounted_monotonic:
+            return
+        duration_s = active_until - state.last_accounted_monotonic
+        state.expected_linear_m += _vector_norm(state.linear_mps) * duration_s
+        state.expected_angular_rad += _vector_norm(state.angular_rps) * duration_s
+        state.last_accounted_monotonic = active_until
+
+    def _feedback_stalled(self, now_monotonic: float) -> bool:
+        state = self._feedback_motion_state
+        if not self._feedback_motion_expected or state is None:
+            return False
+        state_period_s = 1.0 / self.config.server.state_hz
+        if now_monotonic > state.command_expires_monotonic + state_period_s:
+            return False
+        self._advance_feedback_expected(state, now_monotonic)
+        if (
+            now_monotonic - state.started_monotonic
+        ) * 1_000 <= self.config.safety.feedback_stall_ms:
+            return False
+        return (
+            state.expected_linear_m
+            >= FEEDBACK_MIN_LINEAR_PROGRESS_M * FEEDBACK_OBSERVABILITY_FACTOR
+            or state.expected_angular_rad
+            >= FEEDBACK_MIN_ANGULAR_PROGRESS_RAD * FEEDBACK_OBSERVABILITY_FACTOR
+        )
 
     def _observe_feedback(self, snapshot: RobotSnapshot) -> None:
         signature = (
             *snapshot.joint_position_rad,
             *(snapshot.tcp_pose[axis] for axis in ("x", "y", "z", "rx", "ry", "rz")),
         )
+        state = self._feedback_motion_state
+        if state is not None:
+            now_monotonic = time.monotonic()
+            self._advance_feedback_expected(state, now_monotonic)
+            tcp_xyz = tuple(snapshot.tcp_pose[axis] for axis in ("x", "y", "z"))
+            tcp_orientation = tuple(
+                snapshot.tcp_pose[axis] for axis in ("rx", "ry", "rz")
+            )
+            linear_progress = _directional_progress(
+                tuple(
+                    current - baseline
+                    for current, baseline in zip(tcp_xyz, state.baseline_tcp_xyz, strict=True)
+                ),
+                state.linear_mps,
+            )
+            angular_progress = _directional_progress(
+                tuple(
+                    shortest_angular_distance_rad(current, baseline)
+                    for current, baseline in zip(
+                        tcp_orientation,
+                        state.baseline_tcp_orientation_rad,
+                        strict=True,
+                    )
+                ),
+                state.angular_rps,
+            )
+            joint_progress = max(
+                (
+                    abs(current - baseline)
+                    for current, baseline, velocity in zip(
+                        snapshot.joint_position_rad,
+                        state.baseline_joint_position_rad,
+                        snapshot.joint_velocity_rad_s,
+                        strict=True,
+                    )
+                    if abs(velocity) > FEEDBACK_JOINT_VELOCITY_EPSILON_RAD_S
+                    and (current - baseline) * velocity > 0
+                ),
+                default=0.0,
+            )
+            linear_observable = (
+                state.expected_linear_m
+                >= FEEDBACK_MIN_LINEAR_PROGRESS_M * FEEDBACK_OBSERVABILITY_FACTOR
+            )
+            angular_observable = (
+                state.expected_angular_rad
+                >= FEEDBACK_MIN_ANGULAR_PROGRESS_RAD * FEEDBACK_OBSERVABILITY_FACTOR
+            )
+            progress_confirmed = (
+                linear_observable and linear_progress >= FEEDBACK_MIN_LINEAR_PROGRESS_M
+            ) or (
+                angular_observable and angular_progress >= FEEDBACK_MIN_ANGULAR_PROGRESS_RAD
+            ) or (
+                (linear_observable or angular_observable)
+                and joint_progress >= FEEDBACK_MIN_JOINT_PROGRESS_RAD
+            )
+            if progress_confirmed:
+                state.started_monotonic = now_monotonic
+                state.last_accounted_monotonic = now_monotonic
+                state.baseline_joint_position_rad = tuple(snapshot.joint_position_rad)
+                state.baseline_tcp_xyz = tcp_xyz
+                state.baseline_tcp_orientation_rad = tcp_orientation
+                state.expected_linear_m = 0.0
+                state.expected_angular_rad = 0.0
+                self._last_feedback_change_monotonic = now_monotonic
+                self._feedback_signature = signature
+                return
         previous_signature = self._feedback_signature
         feedback_changed = previous_signature is None or len(signature) != len(previous_signature)
         if not feedback_changed and previous_signature is not None:
@@ -1594,6 +1786,36 @@ def _require_exact_vector(
 
 def _vector_norm(vector: tuple[float, float, float]) -> float:
     return math.sqrt(sum(component * component for component in vector))
+
+
+def _same_motion_direction(
+    previous: tuple[float, float, float], current: tuple[float, float, float]
+) -> bool:
+    previous_norm = _vector_norm(previous)
+    current_norm = _vector_norm(current)
+    if previous_norm == 0.0 or current_norm == 0.0:
+        return previous_norm == current_norm
+    cosine = sum(
+        old * new for old, new in zip(previous, current, strict=True)
+    ) / (previous_norm * current_norm)
+    return cosine >= FEEDBACK_DIRECTION_COSINE_MIN
+
+
+def _directional_progress(
+    displacement: tuple[float, float, float],
+    commanded_velocity: tuple[float, float, float],
+) -> float:
+    velocity_norm = _vector_norm(commanded_velocity)
+    if velocity_norm == 0.0:
+        return 0.0
+    return max(
+        0.0,
+        sum(
+            delta * velocity
+            for delta, velocity in zip(displacement, commanded_velocity, strict=True)
+        )
+        / velocity_norm,
+    )
 
 
 def _raw_message_type(text: str) -> str | None:

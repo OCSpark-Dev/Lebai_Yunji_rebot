@@ -158,6 +158,59 @@ def test_direct_stop_uses_bounded_independent_json_rpc(monkeypatch: pytest.Monke
     assert calls["closed"] is True
 
 
+@pytest.mark.parametrize("timeout_stage", ["connect", "request", "first_byte", "body"])
+def test_direct_stop_timeout_reports_phase_and_total_elapsed(
+    monkeypatch: pytest.MonkeyPatch, timeout_stage: str
+) -> None:
+    calls: dict[str, object] = {}
+
+    class FakeSocket:
+        def settimeout(self, value: float) -> None:
+            calls["socket_timeout"] = value
+
+    class FakeResponse:
+        status = 200
+
+        def read(self, amount: int | None = None) -> bytes:
+            if timeout_stage == "body":
+                raise TimeoutError("body timed out")
+            return b'{"jsonrpc":"2.0","id":1,"result":null}'
+
+    class FakeConnection:
+        def __init__(self, host: str, port: int, timeout: float) -> None:
+            self.sock = None
+
+        def connect(self) -> None:
+            if timeout_stage == "connect":
+                raise TimeoutError("connect timed out")
+            self.sock = FakeSocket()
+
+        def request(self, method: str, path: str, body: bytes, headers: dict[str, str]) -> None:
+            if timeout_stage == "request":
+                raise TimeoutError("request timed out")
+
+        def getresponse(self) -> FakeResponse:
+            if timeout_stage == "first_byte":
+                raise TimeoutError("first byte timed out")
+            return FakeResponse()
+
+        def close(self) -> None:
+            calls["closed"] = True
+
+    monotonic_values = iter([10.0, 10.125])
+    monkeypatch.setattr(backends.time, "monotonic", lambda: next(monotonic_values, 10.125))
+    monkeypatch.setattr(backends.http.client, "HTTPConnection", FakeConnection)
+
+    with pytest.raises(TimeoutError) as captured:
+        backends._direct_stop_move("192.0.2.10", 3031, 200)
+
+    message = str(captured.value)
+    assert f"stage={timeout_stage}" in message
+    assert "total_elapsed_ms=125.000" in message
+    assert "configured_timeout_ms=200" in message
+    assert calls["closed"] is True
+
+
 @pytest.mark.parametrize(
     "payload",
     [

@@ -29,6 +29,7 @@ phone [x, y, z] -> TCP [rx, ry, rz] = [y, -x, z]
 - 松开任一 DEADMAN、松开轴键、切换速度、安全状态变差、状态或租约过期、App 进入后台、WebSocket 出错/断开都会在本地立即清零，并尽力发送 `stop`。
 - 触屏 `motion.cartesian_velocity` 与姿态 `pose.sample` 共用一个容量为 1 的 ACK credit：同一时刻最多一条连续运动帧在途，等待期间只更新最新触屏/传感器输入，不继续向 WebSocket 排队；精确匹配 ACK 后立即尝试发送最新输入。两者仍最多 20 Hz，触屏单条命令持续 100 ms；姿态由服务端按 `20 ms` 到 `min(300 ms, watchdog_ms)` 的已确认样本间隔换算角速度。
 - 在途运动 ACK 的本地期限为 `clamp(watchdog_ms - 50 ms, 50 ms, 250 ms)`；超时或 `error.ack_seq` 命中当前在途帧时立即 `motion.stop` 并释放租约。`motion.stop` 不占用 credit，松手/后台/断开路径不会等待运动 ACK。
+- `control.acquire` 会跟踪准确请求序号并阻止重复申请；申请错误清除 matching pending。收到 `LEASE_REQUIRED` 或 `LEASE_EXPIRED` 时，无论 recoverable 标志如何，都清除租约、pending、运动 credit、DEADMAN 和姿态基线，允许重新申请；重新获租后必须再次姿态归零。
 - 软件停止不能代替实体急停。真机调试必须由受训人员在实体急停可触达、空载、低速、底盘锁定的条件下进行。
 - 夹爪 DEADMAN 只授权发送一次 `gripper.set` 目标；松手/后台/断线后的 `motion.stop` 不能保证中途停止 LMG-90，真机前必须单独验证停止/保持和人工解困。
 

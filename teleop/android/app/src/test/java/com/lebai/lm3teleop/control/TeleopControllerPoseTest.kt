@@ -11,6 +11,8 @@ import com.lebai.lm3teleop.network.TransportState
 import com.lebai.lm3teleop.protocol.ServerMessage
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.concurrent.CopyOnWriteArrayList
@@ -198,6 +200,86 @@ class TeleopControllerPoseTest {
             assertTrue(transport.releaseSent.await(1, TimeUnit.SECONDS))
             assertEquals(null, snapshots.last().leaseId)
         } finally {
+            scheduler.shutdownNow()
+        }
+    }
+
+    @Test
+    fun feedbackStallRevocationAllowsNewLeaseToPrimeFreshCalibration() {
+        val scheduler = Executors.newSingleThreadScheduledExecutor()
+        val snapshots = CopyOnWriteArrayList<ControllerSnapshot>()
+        lateinit var transport: CapturingTransport
+        val controller = TeleopController(
+            clientId = "client-1",
+            appVersion = "test",
+            listener = snapshots::add,
+            monotonicClock = { 1_000L },
+            scheduler = scheduler,
+            transportFactory = { listener ->
+                CapturingTransport(listener, poseTarget = 2).also { transport = it }
+            },
+        )
+
+        try {
+            establishLease(controller, transport.listener)
+            assertTrue(
+                controller.startPoseMotion(
+                    "calibration-old",
+                    calibrated(UnitQuaternion.IDENTITY, 1_000_000_000L),
+                ),
+            )
+            assertTrue(transport.firstPose.await(1, TimeUnit.SECONDS))
+
+            transport.listener.onServerMessage(
+                ServerMessage.SafetyEvent(
+                    seq = 3L,
+                    sentAtMs = 5_003L,
+                    severity = "error",
+                    code = "FEEDBACK_STALLED",
+                    message = "joint and TCP feedback did not change",
+                    action = "stop",
+                ),
+            )
+
+            assertTrue(transport.releaseSent.await(1, TimeUnit.SECONDS))
+            assertNull(snapshots.last().leaseId)
+            assertFalse(snapshots.last().deadmanActive)
+            assertNull(snapshots.last().motionInput)
+            assertFalse(
+                controller.updatePoseMotion(
+                    "calibration-old",
+                    calibrated(axisAngle(z = 1.0, degrees = 1.0), 1_020_000_000L),
+                ),
+            )
+
+            assertTrue(controller.requestControl())
+            transport.listener.onServerMessage(
+                ServerMessage.ControlStatus(
+                    seq = 4L,
+                    sentAtMs = 5_004L,
+                    granted = true,
+                    leaseId = "lease-2",
+                    ownerClientId = "client-1",
+                    expiresAtMs = 8_000L,
+                    reason = "granted",
+                ),
+            )
+            assertTrue(
+                controller.startPoseMotion(
+                    "calibration-new",
+                    calibrated(UnitQuaternion.IDENTITY, 1_100_000_000L),
+                ),
+            )
+            assertTrue(awaitPoseCount(transport, 2))
+
+            val freshPriming = transport.frames.filter { it.first == "pose.sample" }[1].second
+            assertEquals("calibration-new", freshPriming.getString("calibration_id"))
+            val delta = freshPriming.getJSONObject("angular_delta_rad")
+            assertEquals(0.0, delta.getDouble("rx"), 0.0)
+            assertEquals(0.0, delta.getDouble("ry"), 0.0)
+            assertEquals(0.0, delta.getDouble("rz"), 0.0)
+        } finally {
+            controller.stopMotion("test_complete")
             scheduler.shutdownNow()
         }
     }

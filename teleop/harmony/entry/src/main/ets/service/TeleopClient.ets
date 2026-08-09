@@ -166,6 +166,8 @@ export class TeleopClient {
   private leaseId: string = '';
   private leaseExpiresAtMs: number = 0;
   private leaseDeadlineUptimeMs: number = 0;
+  private pendingAcquire: boolean = false;
+  private pendingAcquireSeq: number | undefined = undefined;
   private robotMode: string = '未知';
   private estopReason: string = '-';
   private motionReady: boolean = false;
@@ -300,7 +302,20 @@ export class TeleopClient {
     copy.workspace_clear = this.safetyAck.workspace_clear;
     copy.estop_accessible = this.safetyAck.estop_accessible;
     copy.tool_secure = this.safetyAck.tool_secure;
-    this.sendEnvelope('control.acquire', new AcquireBody(copy));
+    this.pendingAcquire = true;
+    this.pendingAcquireSeq = undefined;
+    const sequence = this.sendEnvelope('control.acquire', new AcquireBody(copy));
+    if (sequence === undefined) {
+      this.pendingAcquire = false;
+      this.pendingAcquireSeq = undefined;
+      this.lastEvent = 'control.acquire 发送失败';
+      this.emitSnapshot();
+      return;
+    }
+    if (!this.pendingAcquire) {
+      return;
+    }
+    this.pendingAcquireSeq = sequence;
     this.lastEvent = `已完成 ${OPERATOR_HOLD_MS} ms 长按，等待 control.status`;
     this.emitSnapshot();
   }
@@ -584,7 +599,9 @@ export class TeleopClient {
       this.connectionState = '已连接，等待 welcome';
       this.nextSeq = 0;
       this.lastServerSeq = -1;
-      this.serverWallClockOffsetMs = 0;
+      this.serverTimeAtWelcomeMs = 0;
+      this.serverWelcomeUptimeMs = -1;
+      this.lastOutboundServerTimeMs = 0;
       this.sendEnvelope('session.hello', new HelloBody(this.clientId, this.clientName));
       this.lastEvent = 'hello 已发送；等待服务端 welcome';
       this.emitSnapshot();
@@ -729,7 +746,16 @@ export class TeleopClient {
       const pending = this.motionInFlight;
       const motionCommandError = body.ack_seq !== undefined && pending !== undefined &&
         pending.seq === body.ack_seq;
-      if (motionCommandError) {
+      const failedAcquire = body.ack_seq !== undefined && this.pendingAcquire &&
+        (this.pendingAcquireSeq === undefined || this.pendingAcquireSeq === body.ack_seq);
+      if (failedAcquire) {
+        this.pendingAcquire = false;
+        this.pendingAcquireSeq = undefined;
+      }
+      const leaseFatal = body.code === 'LEASE_REQUIRED' || body.code === 'LEASE_EXPIRED';
+      if (leaseFatal) {
+        this.failClosed(errorText, true);
+      } else if (motionCommandError) {
         this.failClosed(`motion_server_error:${body.code}`, true);
       } else if (body.recoverable) {
         this.lastEvent = errorText;
@@ -786,6 +812,8 @@ export class TeleopClient {
   }
 
   private handleControlStatus(envelope: ProtocolEnvelope, body: ControlStatusBody): void {
+    this.pendingAcquire = false;
+    this.pendingAcquireSeq = undefined;
     const nowUptimeMs = this.monotonicNowMs();
     const serverRemainingMs = body.expires_at_ms === undefined ? 0 : body.expires_at_ms - envelope.sent_at_ms;
     if (body.granted && body.lease_id && body.owner_client_id === this.clientId &&
@@ -1345,7 +1373,8 @@ export class TeleopClient {
   }
 
   private canAcquireControl(): boolean {
-    return this.baseSafetyReady() && this.robotMode === 'IDLE' && this.leaseId.length === 0;
+    return this.baseSafetyReady() && this.robotMode === 'IDLE' && this.leaseId.length === 0 &&
+      !this.pendingAcquire;
   }
 
   private hasSafeLease(allowMoving: boolean): boolean {
@@ -1400,6 +1429,8 @@ export class TeleopClient {
     }
     this.deadmanHeld = false;
     this.deadmanTouchId = -1;
+    this.pendingAcquire = false;
+    this.pendingAcquireSeq = undefined;
     this.poseDeadmanHeld = false;
     this.poseDeadmanTouchId = -1;
     this.activeAxis = AxisName.NONE;
@@ -1444,7 +1475,9 @@ export class TeleopClient {
     this.socket = undefined;
     this.connected = false;
     this.welcomed = false;
-    this.serverWallClockOffsetMs = 0;
+    this.serverTimeAtWelcomeMs = 0;
+    this.serverWelcomeUptimeMs = -1;
+    this.lastOutboundServerTimeMs = 0;
     this.connectionState = '未连接';
     this.clearLocalControl();
     this.safetyAck = new SafetyAck();
@@ -1472,7 +1505,9 @@ export class TeleopClient {
     this.socket = undefined;
     this.connected = false;
     this.welcomed = false;
-    this.serverWallClockOffsetMs = 0;
+    this.serverTimeAtWelcomeMs = 0;
+    this.serverWelcomeUptimeMs = -1;
+    this.lastOutboundServerTimeMs = 0;
     this.connectionState = '连接已断开';
     this.clearLocalControl();
     this.safetyAck = new SafetyAck();
@@ -1486,6 +1521,8 @@ export class TeleopClient {
     this.leaseId = '';
     this.leaseExpiresAtMs = 0;
     this.leaseDeadlineUptimeMs = 0;
+    this.pendingAcquire = false;
+    this.pendingAcquireSeq = undefined;
     this.deadmanHeld = false;
     this.deadmanTouchId = -1;
     this.poseDeadmanHeld = false;
