@@ -47,7 +47,7 @@ class TeleopControllerConcurrencyTest {
         )
 
         try {
-            controller.connect("wss://robot.example.com/teleop", "phone", "secret")
+            controller.connect("wss://robot.example.com/teleop", "phone")
             transport.listener.onTransportState(TransportState.OPEN, "open")
             transport.listener.onServerMessage(
                 ServerMessage.Welcome(

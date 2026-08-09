@@ -64,29 +64,6 @@
                 android:maxLines="1"
                 android:textSize="15sp" />
 
-            <EditText
-                android:id="@+id/clientNameInput"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:autofillHints="name"
-                android:hint="操作者/终端名称"
-                android:imeOptions="actionNext"
-                android:inputType="textPersonName"
-                android:maxLines="1"
-                android:textSize="15sp" />
-
-            <EditText
-                android:id="@+id/tokenInput"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:hint="共享 token（不会持久化）"
-                android:importantForAutofill="no"
-                android:imeOptions="actionDone"
-                android:inputType="textPassword"
-                android:maxLines="1"
-                android:saveEnabled="false"
-                android:textSize="15sp" />
-
             <TextView
                 android:id="@+id/transportWarning"
                 android:layout_width="match_parent"
@@ -141,7 +118,7 @@
                 android:layout_height="wrap_content"
                 android:layout_marginTop="8dp"
                 android:fontFamily="monospace"
-                android:text="连接: 未连接\n认证: 未完成\n底盘锁定: 未知\n看门狗: 未知\n控制权: 无\n录制: 未录制"
+                android:text="连接: 未连接\n握手: 未完成\n底盘锁定: 未知\n看门狗: 未知\n控制权: 无\n录制: 未录制"
                 android:textColor="@color/text_primary"
                 android:textIsSelectable="true"
                 android:textSize="13sp" />

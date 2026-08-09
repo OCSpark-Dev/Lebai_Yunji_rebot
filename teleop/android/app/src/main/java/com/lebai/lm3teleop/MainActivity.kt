@@ -70,10 +70,6 @@ class MainActivity : Activity() {
             preferences.edit().putString(KEY_CLIENT_ID, it).apply()
         }
         binding.endpointInput.setText(preferences.getString(KEY_ENDPOINT, ""))
-        binding.clientNameInput.setText(
-            preferences.getString(KEY_CLIENT_NAME, null)
-                ?: "${Build.MANUFACTURER} ${Build.MODEL}".trim(),
-        )
 
         controller = TeleopController(
             clientId = clientId,
@@ -116,7 +112,6 @@ class MainActivity : Activity() {
         gyroHolding = false
         resetOrientationInput("App 已进入后台，姿态归零已清除")
         if (::orientationSensor.isInitialized) orientationSensor.stop()
-        if (::binding.isInitialized) binding.tokenInput.text?.clear()
         if (::controller.isInitialized) controller.onAppBackground()
         super.onPause()
     }
@@ -145,25 +140,13 @@ class MainActivity : Activity() {
                 showMessage(validation.error ?: "连接地址无效")
                 return@setOnClickListener
             }
-            val clientName = binding.clientNameInput.text.toString().trim()
-            val token = binding.tokenInput.text.toString().trim()
-            if (clientName.isBlank()) {
-                showMessage("请输入操作者或终端名称")
-                return@setOnClickListener
-            }
-            if (token.isBlank()) {
-                showMessage("请输入共享 token")
-                return@setOnClickListener
-            }
             preferences.edit()
                 .putString(KEY_ENDPOINT, validation.normalizedUrl)
-                .putString(KEY_CLIENT_NAME, clientName)
                 .apply()
             binding.transportWarning.text = validation.warning
                 ?: "WSS 已启用；仍应在隔离控制网中部署并校验证书。"
             resetOrientationInput("正在建立新会话；连接后请重新归零")
-            controller.connect(validation.normalizedUrl!!, clientName, token)
-            binding.tokenInput.text?.clear()
+            controller.connect(validation.normalizedUrl!!, defaultClientName())
         }
 
         binding.disconnectButton.setOnClickListener {
@@ -659,8 +642,6 @@ class MainActivity : Activity() {
         binding.connectButton.isEnabled = !connectedOrConnecting
         binding.disconnectButton.isEnabled = connectedOrConnecting
         binding.endpointInput.isEnabled = !connectedOrConnecting
-        binding.clientNameInput.isEnabled = !connectedOrConnecting
-        binding.tokenInput.isEnabled = !connectedOrConnecting
 
         binding.unlockHoldButton.isEnabled = snapshot.canRequestControl
         binding.unlockHoldButton.text = when {
@@ -713,7 +694,7 @@ class MainActivity : Activity() {
 
     private fun buildStatusText(snapshot: ControllerSnapshot): String = buildString {
         append("连接: ${snapshot.transportState} (${snapshot.transportDetail})\n")
-        append("认证: ${if (snapshot.welcomeReceived) "已收到 welcome" else "未完成"}")
+        append("握手: ${if (snapshot.welcomeReceived) "已收到 welcome" else "未完成"}")
         if (snapshot.welcomeReceived && !snapshot.protocolCompatible) append(" [参数不兼容]")
         append('\n')
         append("会话: ${snapshot.sessionId ?: "-"}  模式: ${snapshot.mode ?: "-"}\n")
@@ -762,11 +743,13 @@ class MainActivity : Activity() {
         Toast.makeText(this, message, Toast.LENGTH_LONG).show()
     }
 
+    private fun defaultClientName(): String =
+        Build.MODEL.trim().replace(Regex("\\s+"), " ").take(48).ifBlank { "Android phone" }
+
     companion object {
         private const val PREFS_NAME = "lm3_up_teleop_settings"
         private const val KEY_CLIENT_ID = "client_id"
         private const val KEY_ENDPOINT = "endpoint"
-        private const val KEY_CLIENT_NAME = "client_name"
         private const val UNLOCK_HOLD_MS = 1_500L
         private const val ORIENTATION_UI_PERIOD_NS = 50_000_000L
     }

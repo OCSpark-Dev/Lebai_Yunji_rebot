@@ -133,7 +133,7 @@ class MotionAndSafetyTest {
         estopReason: String? = null,
     ): GateContext = GateContext(
         socketOpen = true,
-        authenticated = true,
+        sessionReady = true,
         appForeground = appForeground,
         leaseId = leaseId,
         leaseDeadlineMonotonicMs = leaseDeadlineMonotonicMs,

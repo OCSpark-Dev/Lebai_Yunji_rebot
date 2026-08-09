@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hmac
 import logging
 import math
 import time
@@ -73,7 +72,7 @@ POSE_SAMPLE_BODY_KEYS = frozenset(
 class ClientSession:
     websocket: ServerConnection
     session_id: str = field(default_factory=lambda: uuid.uuid4().hex)
-    authenticated: bool = False
+    hello_complete: bool = False
     client_id: str = ""
     client_name: str = ""
     platform: str = ""
@@ -101,7 +100,7 @@ class TeleopServer:
     def __init__(
         self,
         config: AppConfig,
-        token: str,
+        token: str | None = None,
         *,
         backend: RobotBackend | None = None,
         camera: CameraProvider | None = None,
@@ -115,10 +114,10 @@ class TeleopServer:
             allow_lan_flag=allow_lan_flag,
             allow_ephemeral_port=allow_ephemeral_port,
         )
-        if not isinstance(token, str) or len(token) < 16:
-            raise ConfigError("authentication token must contain at least 16 characters")
+        # Retained only for programmatic compatibility with older callers.
+        # Authentication tokens are no longer inspected, stored, or logged.
+        del token
         self.config = config
-        self.token = token
         if backend is None:
             backend = (
                 HardwareBackend(config.robot)
@@ -260,13 +259,13 @@ class TeleopServer:
                 )
 
     async def _handle_text(self, session: ClientSession, text: str) -> None:
-        stop_was_prioritized = session.authenticated and _raw_message_type(text) == "motion.stop"
+        stop_was_prioritized = session.hello_complete and _raw_message_type(text) == "motion.stop"
         if stop_was_prioritized:
             try:
                 if self.leases.current is not None and not self._owns_lease(session):
                     stop_confirmed = await self._safe_stop(
                         "EXTERNAL_STOP",
-                        "an authenticated non-owner requested a safety stop",
+                        "a session-established non-owner requested a safety stop",
                         revoke=True,
                         stop_recording=True,
                     )
@@ -303,28 +302,31 @@ class TeleopServer:
         try:
             envelope = decode_envelope(text)
         except ProtocolError as error:
-            if session.authenticated and self._owns_lease(session):
+            if session.hello_complete and self._owns_lease(session):
                 await self._safe_stop(error.code, error.message, revoke=True, stop_recording=True)
             await self._send_error(session, error)
             if not error.recoverable:
                 await session.websocket.close(code=1008, reason=error.code)
             return
 
-        if not session.authenticated:
+        if not session.hello_complete:
             if envelope.type != "session.hello":
                 await self._send_error(
                     session,
                     ProtocolError(
-                        "AUTH_FAILED",
+                        "HELLO_REQUIRED",
                         "session.hello must be the first message",
                         recoverable=False,
                         ack_seq=envelope.seq,
                     ),
                 )
-                await session.websocket.close(code=1008, reason="authentication required")
+                await session.websocket.close(code=1008, reason="session.hello required")
                 return
             try:
-                self._validate_message_time(envelope)
+                # The hello frame establishes a lease-free session and returns
+                # server_time_ms so a client with a skewed wall clock can
+                # synchronize. Every post-hello frame is still checked by the
+                # strict timestamp validation below.
                 await self._handle_hello(session, envelope)
             except ProtocolError as error:
                 error.ack_seq = envelope.seq if error.ack_seq is None else error.ack_seq
@@ -418,17 +420,9 @@ class TeleopServer:
         client_name = require_string(body, "client_name")
         platform = require_string(body, "platform")
         require_string(body, "app_version")
-        supplied_token = require_string(body, "auth_token")
         capabilities = body.get("capabilities")
         if not isinstance(capabilities, list) or not all(isinstance(item, str) for item in capabilities):
             raise ProtocolError("INVALID_MESSAGE", "capabilities must be a string array")
-        if not hmac.compare_digest(supplied_token, self.token):
-            await self._send_error(
-                session,
-                ProtocolError("AUTH_FAILED", "authentication failed", recoverable=False, ack_seq=0),
-            )
-            await session.websocket.close(code=1008, reason="authentication failed")
-            return
         session.client_id = client_id
         session.client_name = client_name
         session.platform = platform
@@ -460,7 +454,7 @@ class TeleopServer:
                 },
             },
         )
-        session.authenticated = True
+        session.hello_complete = True
         snapshot = await self._read_snapshot()
         await session.send(
             "robot.state",
@@ -1070,7 +1064,7 @@ class TeleopServer:
             pass
 
     async def _broadcast(self, message_type: str, body: dict[str, Any]) -> None:
-        sessions = [session for session in self.sessions.values() if session.authenticated]
+        sessions = [session for session in self.sessions.values() if session.hello_complete]
         if not sessions:
             return
         results = await asyncio.gather(
@@ -1397,7 +1391,7 @@ def _vector_norm(vector: tuple[float, float, float]) -> float:
 
 def _raw_message_type(text: str) -> str | None:
     # Safety-only pre-parser: it never authenticates or dispatches a command. It
-    # merely lets an already-authenticated session stop before strict validation.
+    # merely lets a session that completed session.hello stop before strict validation.
     try:
         import json
 

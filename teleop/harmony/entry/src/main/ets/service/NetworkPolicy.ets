@@ -30,7 +30,7 @@ export class NetworkPolicy {
       return result;
     }
     if (parsed.username.length > 0 || parsed.password.length > 0) {
-      result.error = '不要把 token 或账号密码写在 URL 中';
+      result.error = '不要把账号密码或其他凭据写在 URL 中';
       return result;
     }
     if (parsed.hash.length > 0) {
@@ -38,7 +38,7 @@ export class NetworkPolicy {
       return result;
     }
     if (parsed.search.length > 0) {
-      result.error = 'WebSocket 地址不能包含 query；token 必须通过 session.hello 发送';
+      result.error = 'WebSocket 地址不能包含 query 或凭据';
       return result;
     }
     if (parsed.hostname.length === 0) {

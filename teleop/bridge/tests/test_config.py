@@ -226,8 +226,17 @@ def test_v1_robot_state_allowlist_cannot_enable_teaching() -> None:
         config.validate()
 
 
-def test_token_never_has_a_config_default() -> None:
-    config = AppConfig()
-    with pytest.raises(ConfigError, match="at least 16"):
-        config.resolved_token({})
-    assert config.resolved_token({"LM3_TELEOP_TOKEN": "0123456789abcdef"}) == "0123456789abcdef"
+def test_legacy_auth_token_env_is_accepted_and_ignored(tmp_path: Path) -> None:
+    config_path = tmp_path / "legacy-token.toml"
+    config_path.write_text(
+        """
+[server]
+auth_token_env = "LM3_TELEOP_TOKEN"
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert not hasattr(config.server, "auth_token_env")
+    config.validate()

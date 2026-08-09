@@ -505,7 +505,7 @@ Modbus 位姿编码：xyz 乘 1000 转毫米；角度按一圈映射到 0-65535�
 ### 16.2 启动和真机门槛
 
 - 安全桥默认只能启动模拟后端并监听 `127.0.0.1`。
-- 真机必须同时显式选择 hardware 后端、给出机器人 IP、设置认证令牌、配置并确认实测的非空 TCP 位置工作空间、TCP `Rx/Ry/Rz` 姿态中心/逐轴容差和六轴限位，并再次确认底盘锁定；`workspace_configured`、`orientation_configured`、`joint_limits_configured` 或任一其他门槛缺失时都应启动失败。
+- 真机必须同时显式选择 hardware 后端、给出机器人 IP、配置并确认实测的非空 TCP 位置工作空间、TCP `Rx/Ry/Rz` 姿态中心/逐轴容差和六轴限位，并再次确认底盘锁定；`workspace_configured`、`orientation_configured`、`joint_limits_configured` 或任一其他门槛缺失时都应启动失败。
 - 桥接器不得调用 `start_sys()`、`stop_sys()`、解除急停、关机或禁用限位。真机上使能和急停复位由现场人员通过受控流程完成。
 - `movej`/`movel` 为异步运动缓冲接口，不能按模型帧率无限写入。连续遥操优先使用受限 `speedl` 或经真机验证的单槽动作执行器，并在 300 ms watchdog、反馈停滞或异常时调用 `stop_move()`。
 
@@ -516,7 +516,7 @@ Modbus 位姿编码：xyz 乘 1000 转毫米；角度按一圈映射到 0-65535�
 - Android/HarmonyOS 都必须在松手、页面不可见、App 后台、WebSocket 错误和断连前尽力发送 `motion.stop`，并在本地立即清零控制状态。
 - 客户端最多 20 Hz 发送运动命令；300 ms 内没有新的有效 deadman 命令时，服务端必须失败关闭并停止。
 - 陀螺仪模式必须由独立按住式 DEADMAN 授权，进入前显式归零；不能与触屏笛卡尔点动并发。服务端必须根据传感器毫秒时间计算角速度并再次限幅，不能直接执行手机提交的绝对姿态。
-- 共享令牌不能写入源码、Git、URL 查询参数或普通日志。开发明文 WS 只能用于隔离局域网，生产使用 WSS/TLS 和设备级凭据。
+- 当前桥接器不提供应用层 token 认证，Android/HarmonyOS 客户端只填写 WebSocket 地址并自动生成终端名。开发明文 WS 只能用于受控机器人网络；跨不可信网络时在桥前部署带设备认证的 WSS/TLS 网关。单写入者租约、DEADMAN、watchdog、限速和真机包络仍是不可绕过的运动安全门。
 
 ### 16.4 数据和模型规则
 

@@ -24,10 +24,10 @@ object NetworkPolicy {
             return EndpointValidation(false, error = "地址必须使用 ws:// 或 wss://")
         }
         if (uri.userInfo != null) {
-            return EndpointValidation(false, error = "不要把 token 写在 URL 中")
+            return EndpointValidation(false, error = "不要把凭据写在 URL 中")
         }
         if (uri.rawQuery != null) {
-            return EndpointValidation(false, error = "WebSocket 地址不能包含查询参数；token 必须单独输入")
+            return EndpointValidation(false, error = "WebSocket 地址不能包含查询参数或凭据")
         }
         if (uri.fragment != null) {
             return EndpointValidation(false, error = "WebSocket 地址不能包含 fragment")

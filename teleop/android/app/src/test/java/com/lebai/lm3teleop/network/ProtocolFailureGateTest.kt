@@ -17,16 +17,14 @@ class ProtocolFailureGateTest {
     }
 
     @Test
-    fun connectionConfigNeverPrintsToken() {
+    fun connectionConfigContainsNoCredentialField() {
         val config = ConnectionConfig(
             url = "wss://robot.example.com/teleop",
             clientId = "client-1",
             clientName = "phone",
             appVersion = "1.0",
-            authToken = "super-secret-token",
         )
 
-        assertFalse(config.toString().contains("super-secret-token"))
-        assertTrue(config.toString().contains("<redacted>"))
+        assertFalse(config.toString().contains("authToken"))
     }
 }

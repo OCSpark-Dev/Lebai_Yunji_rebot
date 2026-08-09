@@ -48,11 +48,9 @@ def main(argv: list[str] | None = None) -> int:
             if args.robot_ip:
                 config.robot.robot_ip = args.robot_ip
             config.validate(hardware_flag=args.hardware, allow_lan_flag=args.allow_lan)
-            token = config.resolved_token()
             asyncio.run(
                 _serve_forever(
                     config,
-                    token,
                     hardware_flag=args.hardware,
                     allow_lan_flag=args.allow_lan,
                 )
@@ -89,14 +87,12 @@ def main(argv: list[str] | None = None) -> int:
 
 async def _serve_forever(
     config: AppConfig,
-    token: str,
     *,
     hardware_flag: bool,
     allow_lan_flag: bool,
 ) -> None:
     server = TeleopServer(
         config,
-        token,
         hardware_flag=hardware_flag,
         allow_lan_flag=allow_lan_flag,
     )

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ipaddress
 import math
-import os
 import re
 import tomllib
 from dataclasses import dataclass, field
@@ -23,7 +22,6 @@ class ServerConfig:
     host: str = "127.0.0.1"
     port: int = 8765
     path: str = "/ws"
-    auth_token_env: str = "LM3_TELEOP_TOKEN"
     allow_lan: bool = False
     state_hz: int = 20
     max_message_age_ms: int = 2_000
@@ -86,15 +84,6 @@ class AppConfig:
     safety: SafetyConfig = field(default_factory=SafetyConfig)
     recording: RecordingConfig = field(default_factory=RecordingConfig)
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
-
-    def resolved_token(self, environ: dict[str, str] | None = None) -> str:
-        source = os.environ if environ is None else environ
-        token = source.get(self.server.auth_token_env, "")
-        if len(token) < 16:
-            raise ConfigError(
-                f"environment variable {self.server.auth_token_env} must contain at least 16 characters"
-            )
-        return token
 
     def validate(
         self,
@@ -292,7 +281,10 @@ def load_config(path: str | Path) -> AppConfig:
     with config_path.open("rb") as handle:
         raw = tomllib.load(handle)
 
-    server_raw = _section(raw, "server")
+    server_raw = dict(_section(raw, "server"))
+    # Compatibility with existing TOML files created before application-layer
+    # token authentication was removed. The value is deliberately ignored.
+    server_raw.pop("auth_token_env", None)
     robot_raw = _section(raw, "robot")
     safety_raw = _section(raw, "safety")
     recording_raw = _section(raw, "recording")

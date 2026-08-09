@@ -83,10 +83,9 @@ export class SafetyAck {
 
 export class HelloBody {
   client_id: string;
-  client_name: string = 'LM3-UP Harmony Teleop';
+  client_name: string;
   platform: string = 'HarmonyOS';
   app_version: string = '1.0.0';
-  auth_token: string;
   capabilities: Array<string> = [
     'cartesian_velocity',
     'gripper',
@@ -94,9 +93,9 @@ export class HelloBody {
     'pose_sample'
   ];
 
-  constructor(clientId: string, authToken: string) {
+  constructor(clientId: string, clientName: string) {
     this.client_id = clientId;
-    this.auth_token = authToken;
+    this.client_name = clientName;
   }
 }
 
@@ -226,10 +225,10 @@ export class ProtocolEnvelope {
   sent_at_ms: number;
   body: Object;
 
-  constructor(type: string, seq: number, body: Object) {
+  constructor(type: string, seq: number, sentAtMs: number, body: Object) {
     this.type = type;
     this.seq = seq;
-    this.sent_at_ms = Date.now();
+    this.sent_at_ms = sentAtMs;
     this.body = body;
   }
 }
@@ -443,8 +442,8 @@ export function validateSafetyEventBody(body: Object): SafetyEventBody | undefin
   return candidate;
 }
 
-export function encodeEnvelope(type: string, seq: number, body: Object): string {
-  return JSON.stringify(new ProtocolEnvelope(type, seq, body));
+export function encodeEnvelope(type: string, seq: number, sentAtMs: number, body: Object): string {
+  return JSON.stringify(new ProtocolEnvelope(type, seq, sentAtMs, body));
 }
 
 export function decodeEnvelope(text: string): ProtocolEnvelope | undefined {

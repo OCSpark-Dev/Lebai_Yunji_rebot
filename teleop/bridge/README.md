@@ -4,17 +4,17 @@
 
 ## 已实现的安全层
 
-- 共享 token，首帧 `session.hello`，每连接双向 `seq=0` 起严格递增；
+- 首帧必须为 `session.hello`，每连接双向 `seq=0` 起严格递增；hello 只建立无租约会话，其 `sent_at_ms` 不做绝对时效校验，welcome 后所有消息恢复严格墙钟校验；`auth_token` 为旧客户端兼容字段，可缺省或为空，服务端不会校验；
 - 单一控制租约、1500 ms 客户端长按声明和四项现场检查；租约配置/请求范围为 500–2000 ms，服务端上限始终为 2000 ms；
 - 只有乐白官方状态码 `5 (IDLE)` 可取得租约，`7 (MOVING)` 和其他状态一律拒绝；
 - 严格单槽 20 Hz token-bucket 限速，不允许客户端靠积攒令牌突发双发；另有 300 ms 独立 watchdog；
 - `pose.sample` 已实现手机 Rotation Vector 的 TCP 旋转 3DoF 增量控制：只执行 `Rx/Ry/Rz`，强制 `X/Y/Z=0`；每个 `calibration_id` 首帧必须为零增量并只做 priming，非零 priming 失败关闭，切换标定时先停止旧运动；priming 帧同样占用 20 Hz motion token，不能靠反复换标定绕过限流；
 - 姿态消息只接受精确 v1 schema、`phone_calibrated/tcp_orientation`、`tracking`、`confidence>=0.8`；同一标定内的传感器间隔限 `20-150 ms`，单帧旋转增量范数限 `0.25 rad`，派生输入角速度范数限 `6.0 rad/s`，之后仍按安全配置把实际角速度钳制到默认 `0.15 rad/s`；
 - 连续有效的非零笛卡尔命令期间，若关节与 TCP 反馈在配置窗口内持续无可观测变化，则撤租、停止并报告 `FEEDBACK_STALLED`；
-- 过期/未来/乱序消息、非有限数值、错误 deadman、无租约和错误坐标系失败关闭；
+- 会话建立后的过期/未来消息，以及所有乱序消息、非有限数值、错误 deadman、无租约和错误坐标系失败关闭；
 - 速度向量范数钳制、有限持续时间、六轴限位余量和 TCP 当前/预测工作空间检查；
 - 真机必须配置 TCP `Rx/Ry/Rz` 姿态中心和逐轴容差；授予租约、所有笛卡尔速度和每个 `pose.sample` 都按角度环绕后的最短距离检查当前姿态，非 priming 运动还检查按有限命令时长预测的姿态，越界返回 `ORIENTATION_LIMIT` 并走既有撤租/停止路径；
-- 任何已认证的 `motion.stop` 都优先执行，即使其 seq 或 body 随后被判无效；非控制者发起停止时还会撤销当前控制租约，防止原控制端沿用旧租约恢复；
+- 任何已完成 `session.hello` 的 `motion.stop` 都优先执行，即使其 seq 或 body 随后被判无效；非控制者发起停止时还会撤销当前控制租约，防止原控制端沿用旧租约恢复；
 - 断连、租约过期、机器人状态异常或后端异常会先撤销控制权，再通过独立停止通道请求 `stop_move()`；
 - 不调用 `start_sys()`、`stop_sys()`、解除急停、关机或底盘控制接口；
 - `gripper.set` 只在当前 TCP XYZ/姿态位于配置包络内才会下发；它的 deadman 只授权一次目标，当前没有经真机验证的夹爪中途停止路径，`stop_move` 不能据此视为会停止 LMG-90；
@@ -29,12 +29,13 @@
 python -m venv .\tmp\lm3-teleop-venv
 & .\tmp\lm3-teleop-venv\Scripts\python.exe -m pip install -e ".\teleop\bridge[test]"
 
-$env:LM3_TELEOP_TOKEN = 'replace-with-at-least-16-random-characters'
 & .\tmp\lm3-teleop-venv\Scripts\python.exe -m lm3_teleop_bridge serve `
   --config .\teleop\configs\lm3-up.sim.toml
 ```
 
 默认地址是 `ws://127.0.0.1:8765/ws`。实体手机无法访问宿主机环回地址；在完成隔离网络和 WSS 前，优先用本机测试客户端或模拟器验证。
+
+桥接器当前不提供应用层身份认证。旧配置中的 `auth_token_env` 会被兼容读取但忽略，旧客户端发送的 `auth_token` 也不会参与鉴权。局域网监听仍需配置 `allow_lan=true` 并传 `--allow-lan`，但这只是监听地址的双重确认，不是访问控制；只能在可信、隔离的机器人网络中使用。需要跨不可信网络时，应在桥接器前部署带设备认证的 WSS/TLS 网关。
 
 ## 真机启动门槛
 
@@ -111,6 +112,6 @@ python -m pytest .\teleop\bridge\tests
 
 测试只使用 `SimulatorBackend` 和本地临时目录，不连接真机。
 
-手机的 `sensor_timestamp_ms` 是设备启动时钟。桥接器能验证同一标定内严格递增和相邻间隔，但无法把它与服务端墙钟直接比较来独立证明样本的绝对年龄；手机端还必须用同源单调时钟检查传感器新鲜度，服务端则另用信封 `sent_at_ms` 检查网络消息时效。
+手机的 `sensor_timestamp_ms` 是设备启动时钟。桥接器能验证同一标定内严格递增和相邻间隔，但无法把它与服务端墙钟直接比较来独立证明样本的绝对年龄；手机端还必须用同源单调时钟检查传感器新鲜度。首个 `session.hello` 为了完成时钟偏差下的会话建立而豁免绝对时效校验，welcome 后服务端仍用信封 `sent_at_ms` 严格检查每条网络消息。
 
 当前交付尚未完成 LM3-UP 真机停机距离/时延测试、Python 3.11 环境测试，以及官方 LeRobot v0.4.2 + FFmpeg 在 Windows 上的完整导出/回读端到端验证；这些项目通过前不得宣称真机或训练数据流水线已经验收。

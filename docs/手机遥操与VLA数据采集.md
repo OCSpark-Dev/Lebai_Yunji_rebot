@@ -62,7 +62,7 @@ LeRobot v0.4.2 的 `examples/phone_to_so100` 是更接近的参考：Android 使
 | --- | --- | --- |
 | Android App | 原生 Rotation Vector、归零校准、按住式陀螺仪 DEADMAN、触屏 XYZ、夹爪、录制与状态显示 | 从陀螺仪推断 XYZ、IK、最终限幅、底盘控制 |
 | HarmonyOS App | 使用 `SensorId.ROTATION_VECTOR` 实现相同的 3DoF 旋转协议和生命周期停机 | 声称拥有未实现的 AR 6DoF 空间跟踪能力 |
-| Python 安全桥 | 认证、最长 2000 ms 单写入者租约、仅 IDLE 授权、严格单槽 20 Hz 限流、300 ms watchdog、连续运动反馈冻结检测、工作空间、pylebai、记录 | 解除急停、自动上使能、底盘导航或持续读取 UP 硬件互锁 |
+| Python 安全桥 | 会话握手、最长 2000 ms 单写入者租约、仅 IDLE 授权、严格单槽 20 Hz 限流、300 ms watchdog、连续运动反馈冻结检测、工作空间、pylebai、记录 | 应用层身份认证、解除急停、自动上使能、底盘导航或持续读取 UP 硬件互锁 |
 | 外部 GPU 主机 | LingBot 数据处理、后训练、推理/影子模式 | 绕过安全桥直接写机器人 |
 | UP 确定性控制器 | 导航、状态确认、底盘锁定与释放 | 接收 VLA 低层轮速 |
 

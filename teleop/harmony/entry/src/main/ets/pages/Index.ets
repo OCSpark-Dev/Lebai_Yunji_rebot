@@ -8,7 +8,6 @@ struct Index {
 
   @State private snapshot: TeleopSnapshot = new TeleopSnapshot();
   @State private endpoint: string = '';
-  @State private authToken: string = '';
   @State private baseStationary: boolean = false;
   @State private workspaceClear: boolean = false;
   @State private estopAccessible: boolean = false;
@@ -32,9 +31,7 @@ struct Index {
   }
 
   private connect(): void {
-    const token = this.authToken;
-    this.client.connect(this.endpoint, token);
-    this.authToken = '';
+    this.client.connect(this.endpoint);
   }
 
   private applySnapshot(snapshot: TeleopSnapshot): void {
@@ -156,14 +153,9 @@ struct Index {
             .onChange((value: string) => {
               this.endpoint = value;
             })
-          TextInput({ text: this.authToken, placeholder: '共享 token（仅本次连接，发送后清空）' })
-            .type(InputType.Password)
-            .showPasswordIcon(true)
-            .width('100%')
-            .height(44)
-            .onChange((value: string) => {
-              this.authToken = value;
-            })
+          Text(`终端：${this.snapshot.clientName}（自动生成，无需输入）`)
+            .fontSize(13)
+            .fontColor('#475467')
           Row({ space: 10 }) {
             Button('连接')
               .layoutWeight(1)

@@ -13,9 +13,33 @@ import org.junit.Test
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
 
-class TeleopControllerAuthenticationTest {
+class TeleopControllerHandshakeTest {
     @Test
-    fun preWelcomeAuthenticationErrorIsShownAndConnectionIsCancelled() {
+    fun connectRequiresNoCredential() {
+        val scheduler = Executors.newSingleThreadScheduledExecutor()
+        lateinit var transport: CapturingTransport
+        val controller = TeleopController(
+            clientId = "client-1",
+            appVersion = "test",
+            listener = {},
+            scheduler = scheduler,
+            transportFactory = { listener ->
+                CapturingTransport(listener).also { transport = it }
+            },
+        )
+
+        try {
+            controller.connect("wss://robot.example.com/teleop", "phone")
+
+            assertEquals("phone", transport.connectedConfig?.clientName)
+        } finally {
+            controller.destroy()
+            scheduler.shutdownNow()
+        }
+    }
+
+    @Test
+    fun preWelcomeHandshakeErrorIsShownAndConnectionIsCancelled() {
         val scheduler = Executors.newSingleThreadScheduledExecutor()
         val snapshots = CopyOnWriteArrayList<ControllerSnapshot>()
         lateinit var transport: CapturingTransport
@@ -30,15 +54,15 @@ class TeleopControllerAuthenticationTest {
         )
 
         try {
-            controller.connect("wss://robot.example.com/teleop", "phone", "secret")
+            controller.connect("wss://robot.example.com/teleop", "phone")
             transport.listener.onTransportState(TransportState.OPEN, "open")
             transport.listener.onServerMessage(
                 ServerMessage.Error(
                     seq = 0L,
                     sentAtMs = 1_000L,
                     ackSeq = 0L,
-                    code = "AUTH_FAILED",
-                    message = "authentication failed",
+                    code = "HELLO_REQUIRED",
+                    message = "session.hello required",
                     recoverable = false,
                 ),
             )
@@ -46,7 +70,7 @@ class TeleopControllerAuthenticationTest {
             val snapshot = snapshots.last()
             assertEquals(TransportState.FAILED, snapshot.transportState)
             assertFalse(snapshot.welcomeReceived)
-            assertTrue(snapshot.lastEvent.contains("AUTH_FAILED: authentication failed"))
+            assertTrue(snapshot.lastEvent.contains("HELLO_REQUIRED: session.hello required"))
             assertEquals(1, transport.cancelCount)
         } finally {
             scheduler.shutdownNow()
@@ -57,8 +81,11 @@ class TeleopControllerAuthenticationTest {
         val listener: TeleopTransportListener,
     ) : TeleopTransport {
         var cancelCount = 0
+        var connectedConfig: ConnectionConfig? = null
 
-        override fun connect(config: ConnectionConfig) = Unit
+        override fun connect(config: ConnectionConfig) {
+            connectedConfig = config
+        }
 
         override fun send(type: String, body: JSONObject): Long? = null
 

@@ -1,4 +1,4 @@
-import { BusinessError, systemDateTime } from '@kit.BasicServicesKit';
+import { BusinessError, deviceInfo, systemDateTime } from '@kit.BasicServicesKit';
 import { webSocket } from '@kit.NetworkKit';
 import { NetworkPolicy } from './NetworkPolicy';
 import {
@@ -63,6 +63,7 @@ export class TeleopSnapshot {
   welcomed: boolean = false;
   foreground: boolean = true;
   connectionState: string = '未连接';
+  clientName: string = 'HarmonyOS phone';
   sessionId: string = '';
   serverMode: string = '-';
   watchdogMs: number = 0;
@@ -123,8 +124,10 @@ export class TeleopClient {
   private foreground: boolean = true;
   private connectionState: string = '未连接';
   private clientId: string = `harmony-${Date.now()}`;
+  private clientName: string = TeleopClient.defaultClientName();
   private nextSeq: number = 0;
   private lastServerSeq: number = -1;
+  private serverWallClockOffsetMs: number = 0;
   private commandTimerId: number = -1;
   private connectTimerId: number = -1;
   private lastUiEmitAtUptimeMs: number = 0;
@@ -198,19 +201,13 @@ export class TeleopClient {
     return this.buildSnapshot();
   }
 
-  connect(url: string, authToken: string): void {
+  connect(url: string): void {
     const validation = NetworkPolicy.validate(url);
     if (!validation.valid) {
       this.lastEvent = validation.error;
       this.emitSnapshot();
       return;
     }
-    if (authToken.length === 0) {
-      this.lastEvent = '共享 token 不能为空';
-      this.emitSnapshot();
-      return;
-    }
-
     this.closeSocket('reconnect', true);
     this.resetConnectionState();
     this.connectionState = '正在连接';
@@ -219,7 +216,7 @@ export class TeleopClient {
 
     const ws = webSocket.createWebSocket();
     this.socket = ws;
-    this.attachSocketEvents(ws, authToken);
+    this.attachSocketEvents(ws);
     this.connectTimerId = setTimeout(() => {
       if (this.socket === ws && !this.welcomed) {
         this.lastEvent = '连接或 welcome 超时，已失败关闭';
@@ -549,8 +546,7 @@ export class TeleopClient {
     this.failClosed('operator_stop_button', true);
   }
 
-  private attachSocketEvents(ws: webSocket.WebSocket, authToken: string): void {
-    let oneShotToken = authToken;
+  private attachSocketEvents(ws: webSocket.WebSocket): void {
     ws.on('open', (error: BusinessError, value: Object) => {
       if (this.socket !== ws) {
         return;
@@ -564,9 +560,9 @@ export class TeleopClient {
       this.connectionState = '已连接，等待 welcome';
       this.nextSeq = 0;
       this.lastServerSeq = -1;
-      this.sendEnvelope('session.hello', new HelloBody(this.clientId, oneShotToken));
-      oneShotToken = '';
-      this.lastEvent = 'hello 已发送；token 不写入本地存储';
+      this.serverWallClockOffsetMs = 0;
+      this.sendEnvelope('session.hello', new HelloBody(this.clientId, this.clientName));
+      this.lastEvent = 'hello 已发送；等待服务端 welcome';
       this.emitSnapshot();
     });
 
@@ -724,6 +720,7 @@ export class TeleopClient {
       this.closeSocket('unsafe_welcome_parameters', true);
       return;
     }
+    this.serverWallClockOffsetMs = body.server_time_ms - Date.now();
     this.clearConnectTimer();
     this.welcomed = true;
     this.connectionState = '协议已就绪';
@@ -1216,7 +1213,8 @@ export class TeleopClient {
     }
     const sequence = this.nextSeq;
     this.nextSeq += 1;
-    const payload = encodeEnvelope(type, sequence, body);
+    const sentAtMs = this.outboundWallClockNowMs(type);
+    const payload = encodeEnvelope(type, sequence, sentAtMs, body);
     const ws = this.socket;
     try {
       ws.send(payload, (error: BusinessError, sent: boolean) => {
@@ -1268,6 +1266,14 @@ export class TeleopClient {
     } catch (error) {
       return -1;
     }
+  }
+
+  private outboundWallClockNowMs(type: string): number {
+    const localNowMs = Date.now();
+    if (type === 'session.hello') {
+      return localNowMs;
+    }
+    return localNowMs + this.serverWallClockOffsetMs;
   }
 
   private failClosed(reason: string, clearLease: boolean): void {
@@ -1326,6 +1332,7 @@ export class TeleopClient {
     this.socket = undefined;
     this.connected = false;
     this.welcomed = false;
+    this.serverWallClockOffsetMs = 0;
     this.connectionState = '未连接';
     this.clearLocalControl();
     this.safetyAck = new SafetyAck();
@@ -1353,6 +1360,7 @@ export class TeleopClient {
     this.socket = undefined;
     this.connected = false;
     this.welcomed = false;
+    this.serverWallClockOffsetMs = 0;
     this.connectionState = '连接已断开';
     this.clearLocalControl();
     this.safetyAck = new SafetyAck();
@@ -1380,6 +1388,7 @@ export class TeleopClient {
     this.stopPoseSensorInternal(true);
     this.connected = false;
     this.welcomed = false;
+    this.serverWallClockOffsetMs = 0;
     this.sessionId = '';
     this.serverMode = '-';
     this.watchdogMs = 0;
@@ -1457,6 +1466,7 @@ export class TeleopClient {
     snapshot.welcomed = this.welcomed;
     snapshot.foreground = this.foreground;
     snapshot.connectionState = this.connectionState;
+    snapshot.clientName = this.clientName;
     snapshot.sessionId = this.sessionId.length > 0 ? this.sessionId : '-';
     snapshot.serverMode = this.serverMode;
     snapshot.watchdogMs = this.watchdogMs;
@@ -1559,5 +1569,13 @@ export class TeleopClient {
       return value;
     }
     return `${value.substring(0, 4)}…${value.substring(value.length - 4)}`;
+  }
+
+  private static defaultClientName(): string {
+    const model = deviceInfo.productModel.trim();
+    if (model.length === 0) {
+      return 'HarmonyOS phone';
+    }
+    return model.substring(0, Math.min(model.length, 48));
   }
 }

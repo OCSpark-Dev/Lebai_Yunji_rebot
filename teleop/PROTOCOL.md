@@ -8,8 +8,8 @@
 
 - 传输：UTF-8 JSON over WebSocket。
 - 开发默认：`ws://127.0.0.1:8765/ws`，只能访问本机模拟器。
-- 局域网：必须显式更改监听地址、设置高强度共享令牌，并把机器人、GPU 主机和手机放入受控网络。
-- 生产：使用反向代理提供 WSS/TLS、设备级凭据、访问日志和网络隔离。令牌不能在 URL 查询参数中传递。
+- 局域网：必须显式更改监听地址，并把机器人、GPU 主机和手机放入受控网络；当前桥接器不提供应用层身份认证。
+- 跨不可信网络：在桥接器前使用反向代理提供 WSS/TLS、设备级凭据、访问日志和网络隔离；凭据不能放在 URL 查询参数中。
 - 一个 WebSocket 文本帧只包含一个完整 JSON 消息；首版不接受二进制控制消息。
 
 ## 2. 通用信封
@@ -31,12 +31,12 @@
 | `protocol` | 必须精确等于 `lm3-teleop.v1` |
 | `type` | 下文定义的消息类型 |
 | `seq` | 每条连接从 0 开始严格递增；重复或倒退的控制消息被拒绝并停止运动 |
-| `sent_at_ms` | Unix epoch 毫秒；桥接器允许配置范围内的时钟偏差，但用服务端单调时钟管理租约和看门狗 |
+| `sent_at_ms` | Unix epoch 毫秒；首个 `session.hello` 只要求为整数，不做绝对时效校验；会话建立后的所有消息必须在配置的时钟偏差内，租约和看门狗始终使用服务端单调时钟 |
 | `body` | 对应类型的数据对象 |
 
 所有速度、位置和角度必须是有限数值。`NaN`、`Infinity`、字符串数字和缺字段都属于协议错误。
 
-## 3. 会话与认证
+## 3. 会话建立
 
 连接后的第一条消息必须是：
 
@@ -51,13 +51,12 @@
     "client_name": "LM3-UP Android Teleop",
     "platform": "android",
     "app_version": "0.1.0",
-    "auth_token": "replace-with-a-random-secret",
     "capabilities": ["cartesian_velocity", "pose_sample", "gripper", "recording"]
   }
 }
 ```
 
-认证成功后服务端返回 `session.welcome`：
+`session.hello` 通过协议、首帧序号和字段校验后，服务端返回 `session.welcome`：
 
 ```json
 {
@@ -87,7 +86,9 @@
 }
 ```
 
-认证失败时服务端返回 `error` 后关闭连接。客户端不得在持久日志中输出 `auth_token`。
+首个 `session.hello` 只建立无租约会话，不授予控制权也不执行运动，因此桥接器不会用 `max_message_age_ms` / `max_future_skew_ms` 拒绝它；客户端可用 `session.welcome.server_time_ms` 诊断或校准墙钟。welcome 之后的 heartbeat、租约和全部控制消息仍按原配置严格检查 `sent_at_ms`，同样偏差会返回 `STALE_MESSAGE`。
+
+`auth_token` 已从当前协议流程移除；旧客户端若仍发送该字段，桥接器会忽略。首帧不是 `session.hello`、首帧 `seq` 不是 0 或字段不合法时，服务端返回 `error` 后关闭连接。
 
 ## 4. 控制租约
 
@@ -185,7 +186,7 @@
 {"lease_id":"a1c4...","reason":"deadman_released"}
 ```
 
-任何已认证会话都可以请求停止；没有控制租约也不能阻止紧急软件停止。若停止来自当前租约之外的已认证会话，服务端同时撤销现有租约，原控制端必须重新完成授权才能继续。
+任何已完成 `session.hello` 的会话都可以请求停止；没有控制租约也不能阻止紧急软件停止。若停止来自当前租约之外的会话，服务端同时撤销现有租约，原控制端必须重新完成授权才能继续。
 
 在硬件模式下，安全桥不等待普通 `pylebai` 后端锁，而是默认通过控制器 `3031` 端口的独立 HTTP JSON-RPC 连接请求 `stop_move`，默认软件 deadline 为 200 ms。该 deadline 只约束桥接器的停止请求等待时间；Windows、Python、网络和机器人控制器都不是硬实时链路，不能据此保证 200 ms 内物理停止。普通 `pylebai` RPC 也可能延迟，因此有限命令持续时间、独立 stop、物理急停和现场监护必须同时存在。
 
@@ -272,7 +273,7 @@
 {"severity":"error","code":"WATCHDOG_TIMEOUT","message":"no valid motion command for 300 ms","action":"stop"}
 ```
 
-常用错误码：`AUTH_FAILED`、`PROTOCOL_MISMATCH`、`INVALID_MESSAGE`、`OUT_OF_ORDER`、`STALE_MESSAGE`、`RATE_LIMITED`、`LEASE_BUSY`、`LEASE_REQUIRED`、`LEASE_EXPIRED`、`DEADMAN_REQUIRED`、`BASE_NOT_LOCKED`、`ROBOT_NOT_READY`、`WORKSPACE_LIMIT`、`ORIENTATION_LIMIT`、`UNSUPPORTED_MODE` 和 `BACKEND_ERROR`。服务端在任一路径发现过期租约时都会先执行统一安全停止、撤租并清除姿态基线；`acquire`/`renew` 不得静默吞掉过期事件。
+常用错误码：`HELLO_REQUIRED`、`PROTOCOL_MISMATCH`、`INVALID_MESSAGE`、`OUT_OF_ORDER`、`STALE_MESSAGE`、`RATE_LIMITED`、`LEASE_BUSY`、`LEASE_REQUIRED`、`LEASE_EXPIRED`、`DEADMAN_REQUIRED`、`BASE_NOT_LOCKED`、`ROBOT_NOT_READY`、`WORKSPACE_LIMIT`、`ORIENTATION_LIMIT`、`UNSUPPORTED_MODE` 和 `BACKEND_ERROR`。服务端在任一路径发现过期租约时都会先执行统一安全停止、撤租并清除姿态基线；`acquire`/`renew` 不得静默吞掉过期事件。
 
 ## 9. 手机 Rotation Vector 3DoF 增量控制
 
@@ -314,7 +315,7 @@
 
 任一 schema、deadman、租约、时间、置信度、跳变、限流、安全检查或后端执行错误都会失败关闭：停止机械臂、撤销租约、清除姿态基线，并返回 `error`。低置信度、传感器跳变、页面隐藏、App 后台、松开 DEADMAN 或断连时，客户端也必须立即清除本地基线并尽力发送 `motion.stop`。
 
-`sensor_timestamp_ms` 与服务端墙钟没有共同纪元，因此服务端只能验证同一标定内的顺序和间隔，不能独立证明传感器样本的绝对年龄。客户端必须用本机同源单调时钟做样本年龄检查；服务端另外只用信封 `sent_at_ms` 检查网络消息时效。两者不能互相替代。
+`sensor_timestamp_ms` 与服务端墙钟没有共同纪元，因此服务端只能验证同一标定内的顺序和间隔，不能独立证明传感器样本的绝对年龄。客户端必须用本机同源单调时钟做样本年龄检查；除首个只建立会话的 `session.hello` 外，服务端另外用信封 `sent_at_ms` 检查网络消息时效。两者不能互相替代。
 
 ## 10. 当前验证边界
 

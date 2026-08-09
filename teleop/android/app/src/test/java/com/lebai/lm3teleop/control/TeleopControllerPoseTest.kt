@@ -206,7 +206,7 @@ class TeleopControllerPoseTest {
     }
 
     private fun establishLease(controller: TeleopController, listener: TeleopTransportListener) {
-        controller.connect("wss://robot.example.com/teleop", "phone", "secret")
+        controller.connect("wss://robot.example.com/teleop", "phone")
         listener.onTransportState(TransportState.OPEN, "open")
         listener.onServerMessage(
             ServerMessage.Welcome(

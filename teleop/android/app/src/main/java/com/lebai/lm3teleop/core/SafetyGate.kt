@@ -21,7 +21,7 @@ data class SafetyChecklist(
 
 data class GateContext(
     val socketOpen: Boolean,
-    val authenticated: Boolean,
+    val sessionReady: Boolean,
     val appForeground: Boolean,
     val leaseId: String?,
     val leaseDeadlineMonotonicMs: Long,
@@ -135,7 +135,7 @@ object SafetyGate {
 
     private fun commonSafetyFailure(context: GateContext): GateDecision? {
         if (!context.socketOpen) return GateDecision(false, "WebSocket 未连接")
-        if (!context.authenticated) return GateDecision(false, "尚未收到兼容的 session.welcome")
+        if (!context.sessionReady) return GateDecision(false, "尚未收到兼容的 session.welcome")
         if (!context.appForeground) return GateDecision(false, "App 不在前台")
         if (!context.checklist.allChecked) return GateDecision(false, "安全检查未全部确认")
         if (!context.robotStateFresh) return GateDecision(false, "robot.state 超过 1000ms 未更新")

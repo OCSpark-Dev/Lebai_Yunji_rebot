@@ -18,10 +18,9 @@ class ConnectionConfig(
     val clientId: String,
     val clientName: String,
     val appVersion: String,
-    internal val authToken: String,
 ) {
     override fun toString(): String =
-        "ConnectionConfig(url=$url, clientId=$clientId, clientName=$clientName, appVersion=$appVersion, authToken=<redacted>)"
+        "ConnectionConfig(url=$url, clientId=$clientId, clientName=$clientName, appVersion=$appVersion)"
 }
 
 enum class TransportState {
@@ -153,14 +152,13 @@ class TeleopWebSocket(
                 webSocket.close(1000, "stale connection")
                 return
             }
-            listener.onTransportState(TransportState.OPEN, "WebSocket 已连接，等待认证")
+            listener.onTransportState(TransportState.OPEN, "WebSocket 已连接，等待会话 welcome")
             val hello = codec.encode(
                 "session.hello",
                 ProtocolBodies.sessionHello(
                     clientId = config.clientId,
                     clientName = config.clientName,
                     appVersion = config.appVersion,
-                    authToken = config.authToken,
                 ),
             )
             if (!webSocket.send(hello.json)) {

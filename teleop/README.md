@@ -39,7 +39,7 @@ Android / HarmonyOS
                     | lm3-teleop.v1 / WebSocket / 20 Hz
                     v
 Python 安全桥
-  token + 单写入者租约 + 时序校验 + 限速 + TCP/关节边界
+  会话握手 + 单写入者租约 + 时序校验 + 限速 + TCP/关节边界
   + 300 ms watchdog + 原始示范录制
                     |
                     | 默认 SimulatorBackend
@@ -50,7 +50,7 @@ LM3 机械臂 / LMG-90 夹爪
 UP 底盘：首版动作空间之外，由独立确定性流程停止并锁定
 ```
 
-桥接器不会调用 `start_sys()`、`stop_sys()`、解除急停、关机、地图或底盘接口。任何已认证会话都可以请求停止；运动权限则只授予一个满足全部安全条件的租约持有者。
+桥接器不会调用 `start_sys()`、`stop_sys()`、解除急停、关机、地图或底盘接口。任何已完成 `session.hello` 的会话都可以请求停止；运动权限则只授予一个满足全部安全条件的租约持有者。
 
 ## 快速验证
 
@@ -85,15 +85,14 @@ python -m venv .\tmp\lm3-teleop-venv
 & .\tmp\lm3-teleop-venv\Scripts\python.exe -m pip install -e ".\teleop\bridge[test]"
 ```
 
-设置至少 16 个字符的随机共享 token，并只监听本机：
+直接启动并只监听本机：
 
 ```powershell
-$env:LM3_TELEOP_TOKEN = 'replace-with-a-random-secret'
 & .\tmp\lm3-teleop-venv\Scripts\python.exe -m lm3_teleop_bridge serve `
   --config .\teleop\configs\lm3-up.sim.toml
 ```
 
-默认入口为 `ws://127.0.0.1:8765/ws`。token 不应写入源码、Git、URL 或普通日志。
+默认入口为 `ws://127.0.0.1:8765/ws`。当前桥接器不提供应用层 token 认证，客户端建立连接时只需 WebSocket 地址。
 
 模拟配置中的相机段默认是注释状态，因此遥操与状态测试可直接运行，但 `recording.start` 会按设计拒绝未配置的相机名。要测试录制，先在本地 TOML 中显式配置 `camera_wrist`，可选再配置 `camera_top`，并安装 camera extra；当前没有“无图像 episode”录制模式。
 
@@ -101,7 +100,7 @@ $env:LM3_TELEOP_TOKEN = 'replace-with-a-random-secret'
 
 Android 和 HarmonyOS 客户端具有相同的操作语义：
 
-1. 输入网关 URL、终端名称和当次 token；
+1. 只输入网关 WebSocket URL；终端名称由客户端根据设备型号自动生成；
 2. 收到兼容的 `session.welcome` 和新鲜 `robot.state`；
 3. 确认底盘停止、工作区清空、急停可触达和工具固定；
 4. 长按 1500 ms 申请控制租约；
@@ -132,7 +131,7 @@ action            = 下一帧实际 [q1, q2, q3, q4, q5, q6, gripper]
 - 从模板创建不提交的本地配置，填入现场确认的 LM3 地址；
 - 配置真实 TCP 工作空间、六轴软限位和安全余量；
 - 由独立流程确认 UP 底盘停止并锁定；
-- 配置强 token，并在受控网络中使用 WSS/TLS；
+- 当前桥接器无应用层认证，只允许部署在受控机器人网络；跨不可信网络时在桥前增加带设备认证的 WSS/TLS 网关；
 - 配置文件 `hardware_enabled=true`，启动时再传 `--hardware`；
 - 现场受训人员监护、物理急停可触达、最低速度、空载和小工作空间。
 

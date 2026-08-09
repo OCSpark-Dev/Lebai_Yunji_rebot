@@ -53,11 +53,46 @@ $checks = [ordered]@{}
 $checks['hello uses canonical type'] = (
   $client.Contains("sendEnvelope('session.hello'")
 )
+$checks['connection UI requires only websocket address'] = (
+  $index.Contains('this.client.connect(this.endpoint)') -and
+  $index.Contains('this.snapshot.clientName') -and
+  -not $index.Contains('authToken') -and
+  -not $index.Contains('共享 token')
+)
+$checks['hello contains no application token'] = (
+  $client.Contains('new HelloBody(this.clientId, this.clientName)') -and
+  -not $client.Contains('authToken') -and
+  -not $protocol.Contains('auth_token')
+)
+$checks['terminal name is generated from the device model'] = (
+  $client.Contains("deviceInfo, systemDateTime") -and
+  $client.Contains('deviceInfo.productModel.trim()') -and
+  $client.Contains("return 'HarmonyOS phone';") -and
+  $protocol.Contains('constructor(clientId: string, clientName: string)') -and
+  $protocol.Contains('this.client_name = clientName;')
+)
 $checks['first outbound seq uses zero before increment'] = (
   $client.Contains('private nextSeq: number = 0;') -and
   $client.Contains('const sequence = this.nextSeq;') -and
   $client.Contains('this.nextSeq += 1;') -and
-  $client.Contains('encodeEnvelope(type, sequence, body)')
+  $client.Contains('encodeEnvelope(type, sequence, sentAtMs, body)')
+)
+$checks['welcome synchronizes outbound wall clock timestamps'] = (
+  $client.Contains('private serverWallClockOffsetMs: number = 0;') -and
+  $client.Contains('this.serverWallClockOffsetMs = body.server_time_ms - Date.now();') -and
+  $client.Contains('const sentAtMs = this.outboundWallClockNowMs(type);') -and
+  $client.Contains('return localNowMs + this.serverWallClockOffsetMs;')
+)
+$checks['hello stays on local wall clock and resets discard offset'] = (
+  $client.Contains("if (type === 'session.hello')") -and
+  $client.Contains('return localNowMs;') -and
+  ([regex]::Matches($client, 'this\.serverWallClockOffsetMs = 0;')).Count -ge 4
+)
+$checks['protocol encoder requires caller supplied timestamp'] = (
+  $protocol.Contains('constructor(type: string, seq: number, sentAtMs: number, body: Object)') -and
+  $protocol.Contains('this.sent_at_ms = sentAtMs;') -and
+  $protocol.Contains('encodeEnvelope(type: string, seq: number, sentAtMs: number, body: Object)') -and
+  -not $protocol.Contains('this.sent_at_ms = Date.now();')
 )
 $checks['envelope requires integer seq and timestamp'] = (
   $protocol.Contains('!isInteger(envelope.seq)') -and

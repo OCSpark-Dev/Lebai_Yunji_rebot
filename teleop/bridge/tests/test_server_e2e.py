@@ -178,13 +178,19 @@ class _PoseExecutionFailingBackend(_FrozenFeedbackBackend):
         return self.speed_calls
 
 
-def _message(message_type: str, seq: int, body: dict) -> str:
+def _message(
+    message_type: str,
+    seq: int,
+    body: dict,
+    *,
+    sent_at_ms: int | None = None,
+) -> str:
     return json.dumps(
         {
             "protocol": PROTOCOL,
             "type": message_type,
             "seq": seq,
-            "sent_at_ms": int(time.time() * 1_000),
+            "sent_at_ms": int(time.time() * 1_000) if sent_at_ms is None else sent_at_ms,
             "body": body,
         }
     )
@@ -218,7 +224,7 @@ def _owned_session(
 ) -> tuple[ClientSession, _MemoryWebSocket, str]:
     websocket = _MemoryWebSocket()
     session = ClientSession(websocket=websocket)  # type: ignore[arg-type]
-    session.authenticated = True
+    session.hello_complete = True
     session.client_id = client_id
     session.last_inbound_seq = 0
     server.sessions = {session.session_id: session}
@@ -284,7 +290,6 @@ async def _successful_handshake_first_server_frame_is_welcome_seq_zero(tmp_path:
     )
     server = TeleopServer(
         config,
-        TOKEN,
         backend=SimulatorBackend(config.robot),
         allow_ephemeral_port=True,
     )
@@ -300,7 +305,6 @@ async def _successful_handshake_first_server_frame_is_welcome_seq_zero(tmp_path:
                         "client_name": "pytest",
                         "platform": "android",
                         "app_version": "0.1.0",
-                        "auth_token": TOKEN,
                         "capabilities": ["cartesian_velocity"],
                     },
                 )
@@ -317,11 +321,148 @@ async def _successful_handshake_first_server_frame_is_welcome_seq_zero(tmp_path:
         await server.close()
 
 
-def test_failed_authentication_first_server_frame_is_auth_error_seq_zero(tmp_path: Path) -> None:
-    asyncio.run(_failed_authentication_first_server_frame_is_auth_error_seq_zero(tmp_path))
+def test_first_non_hello_frame_returns_hello_required_seq_zero(tmp_path: Path) -> None:
+    asyncio.run(_first_non_hello_frame_returns_hello_required_seq_zero(tmp_path))
 
 
-async def _failed_authentication_first_server_frame_is_auth_error_seq_zero(tmp_path: Path) -> None:
+async def _first_non_hello_frame_returns_hello_required_seq_zero(tmp_path: Path) -> None:
+    config = AppConfig(
+        server=ServerConfig(host="127.0.0.1", port=0, state_hz=50),
+        robot=RobotConfig(base_locked=True),
+        recording=RecordingConfig(root=tmp_path / "raw", fps=50),
+    )
+    server = TeleopServer(
+        config,
+        backend=SimulatorBackend(config.robot),
+        allow_ephemeral_port=True,
+    )
+    await server.start()
+    try:
+        async with connect(f"ws://127.0.0.1:{server.bound_port}/ws") as websocket:
+            await websocket.send(_message("heartbeat", 0, {"deadman": False}))
+            first_frame = json.loads(await asyncio.wait_for(websocket.recv(), timeout=2.0))
+            assert first_frame["type"] == "error"
+            assert first_frame["seq"] == 0
+            assert first_frame["body"]["ack_seq"] == 0
+            assert first_frame["body"]["code"] == "HELLO_REQUIRED"
+            assert first_frame["body"]["recoverable"] is False
+    finally:
+        await server.close()
+
+
+@pytest.mark.parametrize(
+    ("clock_skew_ms", "message_fragment"),
+    [
+        (-60_000, "older than"),
+        (60_000, "future"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("next_message_type", "next_body"),
+    [
+        ("heartbeat", {"deadman": False}),
+        (
+            "control.acquire",
+            {
+                "requested_lease_ms": 2_000,
+                "operator_hold_ms": 1_500,
+                "safety_ack": {
+                    "base_stationary": True,
+                    "workspace_clear": True,
+                    "estop_accessible": True,
+                    "tool_secure": True,
+                },
+            },
+        ),
+    ],
+)
+def test_hello_accepts_wall_clock_skew_but_next_message_remains_strict(
+    tmp_path: Path,
+    clock_skew_ms: int,
+    message_fragment: str,
+    next_message_type: str,
+    next_body: dict,
+) -> None:
+    asyncio.run(
+        _hello_accepts_wall_clock_skew_but_next_message_remains_strict(
+            tmp_path,
+            clock_skew_ms,
+            message_fragment,
+            next_message_type,
+            next_body,
+        )
+    )
+
+
+async def _hello_accepts_wall_clock_skew_but_next_message_remains_strict(
+    tmp_path: Path,
+    clock_skew_ms: int,
+    message_fragment: str,
+    next_message_type: str,
+    next_body: dict,
+) -> None:
+    config = AppConfig(
+        server=ServerConfig(
+            host="127.0.0.1",
+            port=0,
+            state_hz=50,
+            max_message_age_ms=500,
+            max_future_skew_ms=500,
+        ),
+        robot=RobotConfig(base_locked=True),
+        recording=RecordingConfig(root=tmp_path / "raw", fps=50),
+    )
+    server = TeleopServer(
+        config,
+        backend=SimulatorBackend(config.robot),
+        allow_ephemeral_port=True,
+    )
+    await server.start()
+    try:
+        async with connect(f"ws://127.0.0.1:{server.bound_port}/ws") as websocket:
+            skewed_sent_at_ms = int(time.time() * 1_000) + clock_skew_ms
+            await websocket.send(
+                _message(
+                    "session.hello",
+                    0,
+                    {
+                        "client_id": "clock-skew-test",
+                        "client_name": "pytest",
+                        "platform": "android",
+                        "app_version": "0.1.0",
+                        "capabilities": ["cartesian_velocity"],
+                    },
+                    sent_at_ms=skewed_sent_at_ms,
+                )
+            )
+            first_frame = json.loads(await asyncio.wait_for(websocket.recv(), timeout=2.0))
+            assert first_frame["type"] == "session.welcome"
+            assert first_frame["seq"] == 0
+            assert server.leases.current is None
+
+            await websocket.send(
+                _message(
+                    next_message_type,
+                    1,
+                    next_body,
+                    sent_at_ms=skewed_sent_at_ms,
+                )
+            )
+            error = await _receive_type(websocket, "error")
+            assert error["body"]["code"] == "STALE_MESSAGE"
+            assert error["body"]["ack_seq"] == 1
+            assert message_fragment in error["body"]["message"]
+            assert server.leases.current is None
+    finally:
+        await server.close()
+
+
+@pytest.mark.parametrize("legacy_token", ["", "wrong-token"])
+def test_legacy_auth_token_is_ignored(tmp_path: Path, legacy_token: str) -> None:
+    asyncio.run(_legacy_auth_token_is_ignored(tmp_path, legacy_token))
+
+
+async def _legacy_auth_token_is_ignored(tmp_path: Path, legacy_token: str) -> None:
     config = AppConfig(
         server=ServerConfig(host="127.0.0.1", port=0, state_hz=50),
         robot=RobotConfig(base_locked=True),
@@ -345,16 +486,14 @@ async def _failed_authentication_first_server_frame_is_auth_error_seq_zero(tmp_p
                         "client_name": "pytest",
                         "platform": "android",
                         "app_version": "0.1.0",
-                        "auth_token": "wrong-token-0123456789",
+                        "auth_token": legacy_token,
                         "capabilities": ["cartesian_velocity"],
                     },
                 )
             )
             first_frame = json.loads(await asyncio.wait_for(websocket.recv(), timeout=2.0))
-            assert first_frame["type"] == "error"
+            assert first_frame["type"] == "session.welcome"
             assert first_frame["seq"] == 0
-            assert first_frame["body"]["code"] == "AUTH_FAILED"
-            assert first_frame["body"]["ack_seq"] == 0
     finally:
         await server.close()
 
@@ -700,7 +839,7 @@ async def _acquire_requires_official_idle_state(tmp_path: Path) -> None:
     backend.speed_cartesian((0.0, 0.0, 0.0), (0.0, 0.0, 0.0), 1_000)
     websocket = _MemoryWebSocket()
     session = ClientSession(websocket=websocket)  # type: ignore[arg-type]
-    session.authenticated = True
+    session.hello_complete = True
     session.client_id = "phone"
     server = TeleopServer(config, TOKEN, backend=backend)
     envelope = Envelope(
@@ -759,7 +898,7 @@ def test_acquire_rejects_robot_outside_motion_envelope(
         server = TeleopServer(config, TOKEN, backend=backend)
         websocket = _MemoryWebSocket()
         session = ClientSession(websocket=websocket)  # type: ignore[arg-type]
-        session.authenticated = True
+        session.hello_complete = True
         session.client_id = "phone"
         envelope = Envelope(
             "control.acquire",
@@ -869,7 +1008,7 @@ def test_acquire_cannot_cross_safety_stop_during_snapshot(tmp_path: Path) -> Non
         server = TeleopServer(config, TOKEN, backend=backend)
         websocket = _MemoryWebSocket()
         session = ClientSession(websocket=websocket)  # type: ignore[arg-type]
-        session.authenticated = True
+        session.hello_complete = True
         session.client_id = "phone"
         server.sessions = {session.session_id: session}
         envelope = Envelope(
@@ -1008,7 +1147,7 @@ async def _safety_epoch_stops_inflight_command_from_becoming_active(tmp_path: Pa
     server = TeleopServer(config, TOKEN, backend=backend)
     websocket = _MemoryWebSocket()
     session = ClientSession(websocket=websocket)  # type: ignore[arg-type]
-    session.authenticated = True
+    session.hello_complete = True
     session.client_id = "phone"
     lease = server.leases.acquire(
         session_id=session.session_id,
@@ -1043,11 +1182,11 @@ async def _safety_epoch_stops_inflight_command_from_becoming_active(tmp_path: Pa
     assert server._motion_active is False
 
 
-def test_authenticated_non_owner_stop_revokes_existing_lease(tmp_path: Path) -> None:
-    asyncio.run(_authenticated_non_owner_stop_revokes_existing_lease(tmp_path))
+def test_session_established_non_owner_stop_revokes_existing_lease(tmp_path: Path) -> None:
+    asyncio.run(_session_established_non_owner_stop_revokes_existing_lease(tmp_path))
 
 
-async def _authenticated_non_owner_stop_revokes_existing_lease(tmp_path: Path) -> None:
+async def _session_established_non_owner_stop_revokes_existing_lease(tmp_path: Path) -> None:
     config = AppConfig(
         robot=RobotConfig(base_locked=True),
         recording=RecordingConfig(root=tmp_path / "raw", fps=20),
@@ -1055,11 +1194,11 @@ async def _authenticated_non_owner_stop_revokes_existing_lease(tmp_path: Path) -
     backend = SimulatorBackend(config.robot)
     server = TeleopServer(config, TOKEN, backend=backend)
     owner = ClientSession(websocket=_MemoryWebSocket())  # type: ignore[arg-type]
-    owner.authenticated = True
+    owner.hello_complete = True
     owner.client_id = "owner"
     owner.last_inbound_seq = 0
     outsider = ClientSession(websocket=_MemoryWebSocket())  # type: ignore[arg-type]
-    outsider.authenticated = True
+    outsider.hello_complete = True
     outsider.client_id = "safety-observer"
     outsider.last_inbound_seq = 0
     server.sessions = {owner.session_id: owner, outsider.session_id: outsider}
@@ -1097,11 +1236,11 @@ async def _external_stop_failure_is_not_acknowledged_as_success(tmp_path: Path) 
     backend = _FailingStopBackend()
     server = TeleopServer(config, TOKEN, backend=backend)
     owner = ClientSession(websocket=_MemoryWebSocket())  # type: ignore[arg-type]
-    owner.authenticated = True
+    owner.hello_complete = True
     owner.client_id = "owner"
     outsider_socket = _MemoryWebSocket()
     outsider = ClientSession(websocket=outsider_socket)  # type: ignore[arg-type]
-    outsider.authenticated = True
+    outsider.hello_complete = True
     outsider.client_id = "safety-observer"
     outsider.last_inbound_seq = 0
     server.sessions = {owner.session_id: owner, outsider.session_id: outsider}
@@ -1164,7 +1303,7 @@ async def _continuous_motion_with_frozen_feedback_fails_closed(tmp_path: Path) -
     server = TeleopServer(config, TOKEN, backend=backend)
     websocket = _MemoryWebSocket()
     session = ClientSession(websocket=websocket)  # type: ignore[arg-type]
-    session.authenticated = True
+    session.hello_complete = True
     session.client_id = "phone"
     server.sessions = {session.session_id: session}
     lease = server.leases.acquire(
@@ -2345,11 +2484,11 @@ def test_server_constructor_rejects_injected_backend_mode_mismatch(tmp_path: Pat
         TeleopServer(config, TOKEN, backend=_HardwareModeBackend())
 
 
-def test_server_constructor_rejects_short_programmatic_token(tmp_path: Path) -> None:
+def test_server_constructor_ignores_legacy_programmatic_token(tmp_path: Path) -> None:
     config = AppConfig(
         robot=RobotConfig(base_locked=True),
         recording=RecordingConfig(root=tmp_path / "raw", fps=20),
     )
 
-    with pytest.raises(ValueError, match="at least 16 characters"):
-        TeleopServer(config, "short", backend=SimulatorBackend(config.robot))
+    server = TeleopServer(config, "short", backend=SimulatorBackend(config.robot))
+    assert server.config is config

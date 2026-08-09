@@ -20,6 +20,7 @@ phone [x, y, z] -> TCP [rx, ry, rz] = [y, -x, z]
 
 - 客户端只在 `session.welcome` 参数兼容、底盘锁定、服务端 watchdog 正常、最近 1 秒内收到无急停/故障的 `robot.state`、四项现场检查全部确认且控制租约有效时允许运动。
 - `robot.state` 新鲜度与本地租约截止时间使用系统单调启动时钟计算，避免设备校时或墙上时钟跳变绕过超时；租约期限按服务端 `expires_at_ms - sent_at_ms` 推导，并在本地上限 2000 ms 内截断。
+- 首帧 `session.hello` 使用手机本地墙钟。收到通过校验的 `session.welcome.server_time_ms` 后，客户端保存“服务端时间 - 本地 `Date.now()`”的偏移，后续所有出站信封的 `sent_at_ms` 都使用 `Date.now()+offset`；断连、重置或新连接会清零该偏移。这个墙钟同步不参与租约、watchdog、状态新鲜度或 IMU 样本年龄判定。
 - 只有机器人处于 `IDLE` 时才能申请控制权。已有租约并实际点动时可接受 `IDLE`、`MOVING` 或兼容桥接状态 `RUNNING`；未点动时仍只接受 `IDLE`，其他状态立即失败关闭。
 - 控制权必须通过 1500 ms 长按申请。触屏点动需要按住通用 DEADMAN 和单个轴键；陀螺仪姿态遥操使用另一个独立按住式“姿态 DEADMAN”，两种运动授权不能并发。
 - DEADMAN 与轴键分别绑定首次按下的触点 ID；其他触点不能接管或覆盖当前输入，同一时间只允许一个笛卡尔轴，夹爪命令也不能与轴向点动并发。
@@ -30,7 +31,7 @@ phone [x, y, z] -> TCP [rx, ry, rz] = [y, -x, z]
 - 软件停止不能代替实体急停。真机调试必须由受训人员在实体急停可触达、空载、低速、底盘锁定的条件下进行。
 - 夹爪 DEADMAN 只授权发送一次 `gripper.set` 目标；松手/后台/断线后的 `motion.stop` 不能保证中途停止 LMG-90，真机前必须单独验证停止/保持和人工解困。
 
-服务端是最终安全边界，必须再次验证认证、严格递增序号、时间有效性、有限数值、租约、DEADMAN、机器人状态、底盘锁定、工作空间和速度限制。服务端必须在 WebSocket 关闭时立即停止，并在 300 ms 内没有新的有效 DEADMAN 运动命令时停止；不能依赖手机成功发送最后一条 `stop`。
+服务端是最终安全边界，必须再次验证会话握手、严格递增序号、时间有效性、有限数值、租约、DEADMAN、机器人状态、底盘锁定、工作空间和速度限制。服务端必须在 WebSocket 关闭时立即停止，并在 300 ms 内没有新的有效 DEADMAN 运动命令时停止；不能依赖手机成功发送最后一条 `stop`。
 
 ### 陀螺仪姿态安全阈值
 
@@ -60,7 +61,7 @@ HarmonyOS `Response.timestamp` 是从设备启动到上报时的纳秒数。客�
 - WebSocket 与安全状态机：`entry/src/main/ets/service/TeleopClient.ets`
 - 硬件陀螺仪门禁与 Rotation Vector 订阅：`entry/src/main/ets/service/PhonePoseSensor.ets`
 
-工程不包含签名配置、证书、私钥或 token。命令行默认生成 unsigned HAP；需要安装到真机时，应在 DevEco Studio 中使用本机受控的调试/发布签名，不要把签名材料提交到 Git。
+工程不包含签名配置、证书、私钥或应用层 token。命令行默认生成 unsigned HAP；需要安装到真机时，应在 DevEco Studio 中使用本机受控的调试/发布签名，不要把签名材料提交到 Git。
 
 ```powershell
 Set-Location 'D:\Coding\lebai_yunji\teleop\harmony'
@@ -74,9 +75,9 @@ $env:Path="$env:JAVA_HOME\bin;$env:NODE_HOME;C:\Program Files\Huawei\DevEco Stud
 & 'C:\Program Files\Huawei\DevEco Studio\tools\hvigor\bin\hvigorw.bat' assembleHap --no-daemon --no-incremental --type-check
 ```
 
-网关地址不写死在源码中，由操作者在 UI 输入 `ws://` 或 `wss://` URL。共享 token 仅保存在当前页面内存中，调用连接后立即清空，不写入首选项、源码、URL 或日志。
+界面唯一需要填写的是 WebSocket 地址，由操作者输入 `ws://` 或 `wss://` URL。客户端不再显示、校验、保存或发送 token；`session.hello` 也不包含 `auth_token`。终端名自动读取 `deviceInfo.productModel`，裁剪到 48 个字符；设备型号为空时回退为 `HarmonyOS phone`，无需操作者输入。
 
-连接策略拒绝 URL 用户名/密码、fragment 和任何 query 参数。明文 `ws://` 只允许 `localhost`、IPv4 `127.0.0.0/8`、IPv6 `::1`、RFC1918（`10/8`、`172.16/12`、`192.168/16`）、`169.254/16` 与 `.local` 名称；不再信任不含点的单标签主机名。`wss://` 不受本地地址范围限制，但同样禁止在 URL 中携带凭据或 query。即使地址获准，明文 WS 也只能用于受控、隔离的开发局域网；生产部署必须使用 WSS/TLS 和设备级凭据。
+连接策略拒绝 URL 用户名/密码、fragment 和任何 query 参数。明文 `ws://` 只允许 `localhost`、IPv4 `127.0.0.0/8`、IPv6 `::1`、RFC1918（`10/8`、`172.16/12`、`192.168/16`）、`169.254/16` 与 `.local` 名称；不再信任不含点的单标签主机名。`wss://` 不受本地地址范围限制，但同样禁止在 URL 中携带凭据或 query。当前客户端面向受控局域网验证，连接时只填写 WebSocket 地址。
 
 ## `lm3-teleop.v1` Harmony 首版协议
 
@@ -92,13 +93,15 @@ $env:Path="$env:JAVA_HOME\bin;$env:NODE_HOME;C:\Program Files\Huawei\DevEco Stud
 }
 ```
 
-正常认证时，服务端首帧必须严格为 `session.welcome` 且 `seq=0`。认证或握手被拒绝时，唯一允许的 welcome 前例外是 `error seq=0`：客户端会严格校验必填的 `code`、`message`、`recoverable`，并在可选 `ack_seq` 存在时校验其整数类型，再显示服务端的真实 `code/message` 并关闭连接；该错误帧不会建立会话。其他 welcome 前消息仍会被拒绝。welcome 之后同一方向、同一连接内的 `seq` 必须严格递增，重复 welcome 也会失败关闭。客户端只接受文本帧，并在分派前验证信封以及每一种服务端消息的必填字段、布尔类型、整数时间戳、有限数值、六维关节/TCP 数据和夹爪范围；非法消息、重复/倒退序号、未知消息类型和二进制消息都会失败关闭。
+建立会话时，服务端首帧必须严格为 `session.welcome` 且 `seq=0`。握手被拒绝时，唯一允许的 welcome 前例外是 `error seq=0`：客户端会严格校验必填的 `code`、`message`、`recoverable`，并在可选 `ack_seq` 存在时校验其整数类型，再显示服务端的真实 `code/message` 并关闭连接；该错误帧不会建立会话。其他 welcome 前消息仍会被拒绝。welcome 之后同一方向、同一连接内的 `seq` 必须严格递增，重复 welcome 也会失败关闭。客户端只接受文本帧，并在分派前验证信封以及每一种服务端消息的必填字段、布尔类型、整数时间戳、有限数值、六维关节/TCP 数据和夹爪范围；非法消息、重复/倒退序号、未知消息类型和二进制消息都会失败关闭。
+
+`session.hello.sent_at_ms` 使用手机当前本地时间，便于服务端在尚未同步时完成首帧处理。welcome 验证成功后，客户端以 `server_time_ms - Date.now()` 计算当前连接的墙钟偏移，后续 `control.acquire`、heartbeat、运动、夹爪和录制等所有出站信封均带服务端对齐的 `sent_at_ms`。该偏移只属于当前 WebSocket 连接，不会被持久化或用于单调安全计时。
 
 客户端发送：
 
 | `type` | `body` 关键字段 |
 | --- | --- |
-| `session.hello` | `client_id`、`client_name`、`platform`、`app_version`、`auth_token`、`capabilities=["cartesian_velocity","gripper","recording","pose_sample"]` |
+| `session.hello` | `client_id`、自动生成的 `client_name`、`platform`、`app_version`、`capabilities=["cartesian_velocity","gripper","recording","pose_sample"]`；不发送 `auth_token` |
 | `control.acquire` | `requested_lease_ms=2000`、`operator_hold_ms=1500`、四项 `safety_ack` |
 | `heartbeat` | 可选 `lease_id`、`deadman=false`；不能刷新运动 watchdog |
 | `motion.cartesian_velocity` | `lease_id`、`deadman=true`、`frame="base"`、线/角速度、`duration_ms=100` |
@@ -127,7 +130,7 @@ HarmonyOS 客户端现已发送仅旋转的 `pose.sample`。它不接受手机�
 
 ## 真机验证顺序
 
-1. 只连接模拟网关，验证认证失败、协议错误、序号倒退、欢迎参数不兼容和断线都失败关闭。
+1. 只连接模拟网关，验证握手拒绝、协议错误、序号倒退、欢迎参数不兼容和断线都失败关闭。
 2. 验证四项检查未完成、状态陈旧、底盘未锁定、急停或错误码非零时不能取得租约。
 3. 在模拟器回放按下/松开触屏 DEADMAN、姿态 DEADMAN、每个轴键、显式归零、首帧 priming、重复传感器时间戳、低精度、样本陈旧、姿态跳变、App 后台和网络中断，确认客户端立即清零，服务端在 300 ms 内停止。
 4. 用模拟后端按标准握持姿态逐轴验证 `[y,-x,z]`，并检查松开后再按不会跳到松手期间的新姿态。

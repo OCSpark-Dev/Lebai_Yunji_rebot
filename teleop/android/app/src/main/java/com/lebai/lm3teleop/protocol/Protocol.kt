@@ -116,12 +116,14 @@ class ProtocolCodec(
     private val clock: () -> Long = System::currentTimeMillis,
 ) {
     private val outboundSeq = AtomicLong(0)
+    private val clockOffsetMs = AtomicLong(0)
     private var lastInboundSeq = -1L
     private var welcomeReceived = false
 
     @Synchronized
     fun reset() {
         outboundSeq.set(0)
+        clockOffsetMs.set(0)
         lastInboundSeq = -1L
         welcomeReceived = false
     }
@@ -133,7 +135,7 @@ class ProtocolCodec(
             .put("protocol", TELEOP_PROTOCOL)
             .put("type", type)
             .put("seq", seq)
-            .put("sent_at_ms", clock())
+            .put("sent_at_ms", clock() + clockOffsetMs.get())
             .put("body", body)
         return OutboundFrame(seq, type, envelope.toString())
     }
@@ -247,6 +249,9 @@ class ProtocolCodec(
 
             else -> throw ProtocolException("unknown server message type: $type")
         }
+        if (message is ServerMessage.Welcome) {
+            clockOffsetMs.set(message.serverTimeMs - clock())
+        }
         lastInboundSeq = seq
         welcomeReceived = message is ServerMessage.Welcome || welcomeReceived
         return message
@@ -258,13 +263,11 @@ object ProtocolBodies {
         clientId: String,
         clientName: String,
         appVersion: String,
-        authToken: String,
     ): JSONObject = JSONObject()
         .put("client_id", clientId)
         .put("client_name", clientName)
         .put("platform", "android")
         .put("app_version", appVersion)
-        .put("auth_token", authToken)
         .put(
             "capabilities",
             JSONArray(listOf("cartesian_velocity", "pose_sample", "gripper", "recording")),

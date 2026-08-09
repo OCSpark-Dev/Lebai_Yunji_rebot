@@ -128,7 +128,7 @@ class TeleopController(
     private var lastEventSeverity = "info"
     private var protocolFailureHandled = false
 
-    fun connect(url: String, clientName: String, authToken: String) {
+    fun connect(url: String, clientName: String) {
         synchronized(lock) {
             resetSessionLocked()
             protocolFailureHandled = false
@@ -144,7 +144,6 @@ class TeleopController(
                 clientId = clientId,
                 clientName = clientName,
                 appVersion = appVersion,
-                authToken = authToken,
             ),
         )
     }
@@ -288,7 +287,7 @@ class TeleopController(
 
     fun stopMotion(reason: String = "deadman_released") {
         val lease: String?
-        val authenticated: Boolean
+        val sessionReady: Boolean
         synchronized(motionSendLock) {
             synchronized(lock) {
                 cancelMotionLoopLocked()
@@ -297,11 +296,11 @@ class TeleopController(
                 motionInput = null
                 clearPoseMotionLocked()
                 lease = leaseId
-                authenticated = welcome != null && transportState == TransportState.OPEN
+                sessionReady = welcome != null && transportState == TransportState.OPEN
                 lastEvent = "已停止：$reason"
                 lastEventSeverity = "info"
             }
-            if (authenticated) {
+            if (sessionReady) {
                 socket.send("motion.stop", ProtocolBodies.motionStop(lease, reason))
             }
         }
@@ -437,7 +436,7 @@ class TeleopController(
                     )
                     transportDetail = if (protocolCompatible) "协议已就绪" else "服务端安全参数不兼容"
                     lastEvent = if (protocolCompatible) {
-                        "认证成功，会话 ${message.sessionId}"
+                        "握手成功，会话 ${message.sessionId}"
                     } else {
                         "服务端参数不兼容：rate=${message.commandRateHz}Hz watchdog=${message.watchdogMs}ms"
                     }
@@ -760,7 +759,7 @@ class TeleopController(
 
     private fun forceSafetyStop(reason: String, releaseLease: Boolean, stopRecording: Boolean) {
         val lease: String?
-        val authenticated: Boolean
+        val sessionReady: Boolean
         val recording: Boolean
         synchronized(motionSendLock) {
             synchronized(lock) {
@@ -770,7 +769,7 @@ class TeleopController(
                 motionInput = null
                 clearPoseMotionLocked()
                 lease = leaseId
-                authenticated = welcome != null && transportState == TransportState.OPEN
+                sessionReady = welcome != null && transportState == TransportState.OPEN
                 recording = recordingActive || recordingPending
                 if (releaseLease) {
                     leaseId = null
@@ -786,7 +785,7 @@ class TeleopController(
                 lastEvent = "安全停止：$reason"
                 lastEventSeverity = "warning"
             }
-            if (authenticated) {
+            if (sessionReady) {
                 socket.send("motion.stop", ProtocolBodies.motionStop(lease, reason))
                 if (stopRecording && recording && !lease.isNullOrBlank()) {
                     socket.send("recording.stop", ProtocolBodies.recordingStop(lease, reason))
@@ -902,7 +901,7 @@ class TeleopController(
 
     private fun gateContextLocked(): GateContext = GateContext(
         socketOpen = transportState == TransportState.OPEN,
-        authenticated = welcome != null && protocolCompatible,
+        sessionReady = welcome != null && protocolCompatible,
         appForeground = appForeground,
         leaseId = leaseId,
         leaseDeadlineMonotonicMs = leaseDeadlineMonotonicMs,

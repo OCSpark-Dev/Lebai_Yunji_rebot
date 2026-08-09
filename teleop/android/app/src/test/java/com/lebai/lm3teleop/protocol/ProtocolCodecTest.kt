@@ -14,7 +14,7 @@ class ProtocolCodecTest {
         val codec = ProtocolCodec { 1234L }
         val first = codec.encode(
             "session.hello",
-            ProtocolBodies.sessionHello("client", "phone", "1.0", "secret"),
+            ProtocolBodies.sessionHello("client", "phone", "1.0"),
         )
         val second = codec.encode("motion.stop", ProtocolBodies.motionStop(null, "test"))
 
@@ -28,6 +28,71 @@ class ProtocolCodecTest {
         assertTrue(
             json.getJSONObject("body").getJSONArray("capabilities").toString().contains("pose_sample"),
         )
+    }
+
+    @Test
+    fun welcomeAlignsSubsequentHeartbeatAndMotionTimestampsToServerClock() {
+        var localTimeMs = 1_900L
+        val codec = ProtocolCodec { localTimeMs }
+
+        val hello = codec.encode(
+            "session.hello",
+            ProtocolBodies.sessionHello("client", "phone", "1.0"),
+        )
+        assertEquals(1_900L, JSONObject(hello.json).getLong("sent_at_ms"))
+
+        localTimeMs = 2_000L
+        codec.parse(
+            envelope(
+                seq = 0,
+                type = "session.welcome",
+                body = validWelcomeBody().put("server_time_ms", 50_000L),
+            ),
+        )
+
+        localTimeMs = 2_025L
+        val heartbeat = codec.encode("heartbeat", ProtocolBodies.heartbeat(null))
+        assertEquals(50_025L, JSONObject(heartbeat.json).getLong("sent_at_ms"))
+
+        localTimeMs = 2_050L
+        val motion = codec.encode("motion.stop", ProtocolBodies.motionStop(null, "test"))
+        assertEquals(50_050L, JSONObject(motion.json).getLong("sent_at_ms"))
+    }
+
+    @Test
+    fun resetClearsServerClockOffsetForNextHello() {
+        var localTimeMs = 2_000L
+        val codec = ProtocolCodec { localTimeMs }
+        codec.parse(
+            envelope(
+                seq = 0,
+                type = "session.welcome",
+                body = validWelcomeBody().put("server_time_ms", 50_000L),
+            ),
+        )
+
+        localTimeMs = 2_100L
+        assertEquals(
+            50_100L,
+            JSONObject(codec.encode("heartbeat", ProtocolBodies.heartbeat(null)).json)
+                .getLong("sent_at_ms"),
+        )
+
+        codec.reset()
+        localTimeMs = 3_000L
+        val hello = codec.encode(
+            "session.hello",
+            ProtocolBodies.sessionHello("client", "phone", "1.0"),
+        )
+        assertEquals(0L, hello.seq)
+        assertEquals(3_000L, JSONObject(hello.json).getLong("sent_at_ms"))
+    }
+
+    @Test
+    fun sessionHelloContainsNoAuthToken() {
+        val body = ProtocolBodies.sessionHello("client", "phone", "1.0")
+
+        assertFalse(body.has("auth_token"))
     }
 
     @Test
@@ -102,21 +167,21 @@ class ProtocolCodecTest {
     }
 
     @Test
-    fun initialServerErrorPreservesAuthenticationFailure() {
+    fun initialServerErrorPreservesHandshakeFailure() {
         val parsed = ProtocolCodec().parse(
             envelope(
                 seq = 0,
                 type = "error",
                 body = JSONObject()
                     .put("ack_seq", 0)
-                    .put("code", "AUTH_FAILED")
-                    .put("message", "authentication failed")
+                    .put("code", "HELLO_REQUIRED")
+                    .put("message", "session.hello required")
                     .put("recoverable", false),
             ),
         ) as ServerMessage.Error
 
-        assertEquals("AUTH_FAILED", parsed.code)
-        assertEquals("authentication failed", parsed.message)
+        assertEquals("HELLO_REQUIRED", parsed.code)
+        assertEquals("session.hello required", parsed.message)
         assertFalse(parsed.recoverable)
     }
 
