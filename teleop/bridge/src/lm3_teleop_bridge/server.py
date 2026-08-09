@@ -1012,7 +1012,12 @@ class TeleopServer:
         if lease is None or lease.session_id != session.session_id:
             return
         now = time.monotonic()
-        if force or now - session.last_lease_status_monotonic >= 0.5:
+        # A client can only extend its local lease deadline from control.status;
+        # heartbeat ACKs intentionally carry no authoritative expiry.  Make a
+        # renewed deadline eligible after at most half of a short lease, while
+        # retaining the 2 Hz cap for ordinary 1-2 second leases.
+        refresh_interval_s = min(0.5, lease.duration_ms / 2_000)
+        if force or now - session.last_lease_status_monotonic >= refresh_interval_s:
             session.last_lease_status_monotonic = now
             await self._send_control_status(session, lease, granted=True, reason="renewed")
 

@@ -140,6 +140,8 @@
 {"lease_id":"a1c4...","deadman":false}
 ```
 
+携带有效 `lease_id` 的 heartbeat 会续租。服务端的续租状态回执节流门槛不得大于“当前租期的一半”和 `500 ms` 中的较小值；收到跨过该门槛后的下一条有效租约消息时，返回新的 `control.status expires_at_ms`，让客户端更新本地单调时钟截止时间。普通 heartbeat `ack` 本身不能被客户端当作权威续租期限。
+
 运动看门狗只由有效的、`deadman=true` 的运动命令刷新。
 
 ## 5. 机械臂运动

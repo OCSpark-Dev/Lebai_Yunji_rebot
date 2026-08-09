@@ -363,6 +363,134 @@ def test_full_simulator_lease_motion_and_watchdog(tmp_path: Path) -> None:
     asyncio.run(_full_simulator_lease_motion_and_watchdog(tmp_path))
 
 
+def test_short_lease_reports_renewed_expiry_before_half_life(tmp_path: Path) -> None:
+    asyncio.run(_short_lease_reports_renewed_expiry_before_half_life(tmp_path))
+
+
+def test_short_lease_stays_valid_at_android_heartbeat_cadence(tmp_path: Path) -> None:
+    asyncio.run(_short_lease_stays_valid_at_android_heartbeat_cadence(tmp_path))
+
+
+async def _short_lease_reports_renewed_expiry_before_half_life(tmp_path: Path) -> None:
+    config = AppConfig(
+        server=ServerConfig(lease_ms=500),
+        robot=RobotConfig(base_locked=True),
+        recording=RecordingConfig(root=tmp_path / "raw", fps=20),
+    )
+    server = TeleopServer(config, TOKEN, backend=SimulatorBackend(config.robot))
+    session, websocket, lease_id = _owned_session(server)
+    lease = server.leases.current
+    assert lease is not None
+    assert lease.duration_ms == 500
+
+    session.last_lease_status_monotonic = time.monotonic() - 0.24
+    await server._maybe_send_lease_status(session, force=False)
+    assert websocket.sent == []
+
+    assert server.leases.renew(session.session_id, lease_id) is lease
+    session.last_lease_status_monotonic = time.monotonic() - 0.26
+    await server._maybe_send_lease_status(session, force=False)
+    messages = _decoded_messages(websocket)
+    assert len(messages) == 1
+    assert messages[0]["type"] == "control.status"
+    assert messages[0]["body"]["granted"] is True
+    assert messages[0]["body"]["lease_id"] == lease_id
+    assert messages[0]["body"]["reason"] == "renewed"
+
+
+async def _short_lease_stays_valid_at_android_heartbeat_cadence(tmp_path: Path) -> None:
+    config = AppConfig(
+        server=ServerConfig(host="127.0.0.1", port=0, state_hz=20, lease_ms=500),
+        robot=RobotConfig(base_locked=True),
+        recording=RecordingConfig(root=tmp_path / "raw", fps=20),
+    )
+    server = TeleopServer(
+        config,
+        TOKEN,
+        backend=SimulatorBackend(config.robot),
+        allow_ephemeral_port=True,
+    )
+    await server.start()
+    try:
+        async with connect(
+            f"ws://127.0.0.1:{server.bound_port}/ws",
+            proxy=None,
+            compression=None,
+        ) as websocket:
+            await websocket.send(
+                _message(
+                    "session.hello",
+                    0,
+                    {
+                        "client_id": "android-short-lease-test",
+                        "client_name": "pytest",
+                        "platform": "android",
+                        "app_version": "0.1.0",
+                        "auth_token": TOKEN,
+                        "capabilities": [],
+                    },
+                )
+            )
+            await _receive_type(websocket, "session.welcome")
+            await _receive_type(websocket, "robot.state")
+            await websocket.send(
+                _message(
+                    "control.acquire",
+                    1,
+                    {
+                        "requested_lease_ms": 2_000,
+                        "operator_hold_ms": 1_500,
+                        "safety_ack": {
+                            "base_stationary": True,
+                            "workspace_clear": True,
+                            "estop_accessible": True,
+                            "tool_secure": True,
+                        },
+                    },
+                )
+            )
+            granted = await _receive_type(websocket, "control.status")
+            lease_id = granted["body"]["lease_id"]
+            client_deadline_ms = granted["body"]["expires_at_ms"]
+            renewed_count = 0
+            sequence = 2
+            started = time.monotonic()
+
+            while time.monotonic() - started < 1.5:
+                await asyncio.sleep(0.15)
+                assert int(time.time() * 1_000) < client_deadline_ms
+                await websocket.send(
+                    _message(
+                        "heartbeat",
+                        sequence,
+                        {"lease_id": lease_id, "deadman": False},
+                    )
+                )
+                while True:
+                    message = json.loads(
+                        await asyncio.wait_for(websocket.recv(), timeout=0.4)
+                    )
+                    if message["type"] == "error":
+                        raise AssertionError(f"heartbeat failed: {message!r}")
+                    if message["type"] == "control.status":
+                        assert message["body"]["granted"] is True
+                        assert message["body"]["lease_id"] == lease_id
+                        assert message["body"]["reason"] == "renewed"
+                        client_deadline_ms = message["body"]["expires_at_ms"]
+                        renewed_count += 1
+                    if (
+                        message["type"] == "ack"
+                        and message["body"]["ack_seq"] == sequence
+                    ):
+                        break
+                sequence += 1
+
+            assert renewed_count >= 4
+            assert int(time.time() * 1_000) < client_deadline_ms
+    finally:
+        await server.close()
+
+
 async def _full_simulator_lease_motion_and_watchdog(tmp_path: Path) -> None:
     config = AppConfig(
         server=ServerConfig(host="127.0.0.1", port=0, state_hz=20),
