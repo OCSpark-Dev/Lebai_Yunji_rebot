@@ -20,7 +20,7 @@ from .backends import (
     backend_ready,
 )
 from .camera import CameraProvider, NullCameraProvider, OpenCVCameraProvider
-from .config import AppConfig, ConfigError
+from .config import AppConfig, ConfigError, ORIENTATION_GIMBAL_LOCK_MARGIN_RAD
 from .protocol import (
     Envelope,
     ProtocolError,
@@ -39,7 +39,9 @@ from .safety import (
     TokenBucket,
     clamp_twist,
     joints_within_margin,
+    predict_orientation_ok,
     predict_workspace_ok,
+    shortest_angular_distance_rad,
 )
 
 
@@ -379,7 +381,7 @@ class TeleopServer:
             actuator_message = (
                 envelope.type.startswith("motion.") and envelope.type != "motion.stop"
             ) or envelope.type in {"gripper.set", "pose.sample"}
-            if actuator_message and self._owns_lease(session):
+            if (actuator_message or error.code == "LEASE_EXPIRED") and self._owns_lease(session):
                 await self._safe_stop(error.code, error.message, revoke=True, stop_recording=True)
             await self._send_error(session, error)
         except Exception as error:  # fail closed at the hardware boundary
@@ -446,6 +448,12 @@ class TeleopServer:
                     "max_command_duration_ms": self.config.safety.max_command_duration_ms,
                     "workspace_min_m": list(self.config.safety.workspace_min_m),
                     "workspace_max_m": list(self.config.safety.workspace_max_m),
+                    "orientation_configured": self.config.safety.orientation_configured,
+                    "orientation_center_rad": list(self.config.safety.orientation_center_rad),
+                    "orientation_tolerance_rad": list(
+                        self.config.safety.orientation_tolerance_rad
+                    ),
+                    "orientation_gimbal_lock_margin_rad": ORIENTATION_GIMBAL_LOCK_MARGIN_RAD,
                     "joint_min_rad": list(self.config.safety.joint_min_rad),
                     "joint_max_rad": list(self.config.safety.joint_max_rad),
                     "joint_limit_margin_rad": self.config.safety.joint_limit_margin_rad,
@@ -533,6 +541,9 @@ class TeleopServer:
                 },
             )
             return
+        if await self._stop_expired_lease():
+            return
+        acquire_epoch = self._safety_epoch
         if self._stop_lock.locked():
             await session.send(
                 "control.status",
@@ -558,7 +569,35 @@ class TeleopServer:
                 },
             )
             return
-        if self._stop_lock.locked():
+        if self._motion_envelope_error(
+            snapshot,
+            linear=(0.0, 0.0, 0.0),
+            angular=(0.0, 0.0, 0.0),
+            duration_ms=0,
+        ) is not None:
+            await session.send(
+                "control.status",
+                {
+                    "granted": False,
+                    "lease_id": "",
+                    "owner_client_id": self.leases.current.client_id if self.leases.current else "",
+                    "expires_at_ms": 0,
+                    "reason": "robot_not_within_configured_motion_envelope",
+                },
+            )
+            return
+        interrupted_by_stop = False
+        async with self._stop_lock:
+            if acquire_epoch != self._safety_epoch:
+                interrupted_by_stop = True
+                lease = None
+            else:
+                lease = self.leases.acquire(
+                    session_id=session.session_id,
+                    client_id=session.client_id,
+                    requested_ms=requested,
+                )
+        if interrupted_by_stop:
             await session.send(
                 "control.status",
                 {
@@ -570,11 +609,8 @@ class TeleopServer:
                 },
             )
             return
-        lease = self.leases.acquire(
-            session_id=session.session_id,
-            client_id=session.client_id,
-            requested_ms=requested,
-        )
+        if lease is None and await self._stop_expired_lease():
+            return
         if lease is None:
             current = self.leases.current
             await session.send(
@@ -676,6 +712,26 @@ class TeleopServer:
             if self._motion_active:
                 await self._execute_stop()
                 lease = self._require_lease(session, body)
+            command_epoch = self._safety_epoch
+            lease_id = lease.lease_id
+            snapshot = await self._read_snapshot()
+            envelope_error = self._motion_envelope_error(
+                snapshot,
+                linear=(0.0, 0.0, 0.0),
+                angular=(0.0, 0.0, 0.0),
+                duration_ms=0,
+            )
+            if envelope_error == "WORKSPACE_LIMIT":
+                raise ProtocolError(
+                    envelope_error,
+                    "current TCP is outside the configured workspace",
+                )
+            if envelope_error == "ORIENTATION_LIMIT":
+                raise ProtocolError(
+                    envelope_error,
+                    "current TCP orientation is outside the configured envelope",
+                )
+            self._assert_command_current(session, lease_id, command_epoch)
             self._pose_states[session.session_id] = PoseSampleState(
                 calibration_id=calibration_id,
                 last_sensor_timestamp_ms=sensor_timestamp_ms,
@@ -777,9 +833,19 @@ class TeleopServer:
         snapshot = await self._read_snapshot()
         if not self._snapshot_ready(snapshot):
             raise ProtocolError("ROBOT_NOT_READY", "robot state does not allow motion")
-        tcp_xyz = tuple(snapshot.tcp_pose[axis] for axis in ("x", "y", "z"))
-        if not predict_workspace_ok(tcp_xyz, linear, duration, self.config.safety):
+        envelope_error = self._motion_envelope_error(
+            snapshot,
+            linear=linear,
+            angular=angular,
+            duration_ms=duration,
+        )
+        if envelope_error == "WORKSPACE_LIMIT":
             raise ProtocolError("WORKSPACE_LIMIT", "current or predicted TCP is outside the workspace")
+        if envelope_error == "ORIENTATION_LIMIT":
+            raise ProtocolError(
+                "ORIENTATION_LIMIT",
+                "current or predicted TCP orientation is outside the configured envelope",
+            )
         async with self._backend_lock:
             self._assert_command_current(session, lease.lease_id, command_epoch)
             motion_id = await asyncio.to_thread(
@@ -835,6 +901,22 @@ class TeleopServer:
         snapshot = await self._read_snapshot()
         if not self._snapshot_ready(snapshot):
             raise ProtocolError("ROBOT_NOT_READY", "robot state does not allow gripper motion")
+        envelope_error = self._motion_envelope_error(
+            snapshot,
+            linear=(0.0, 0.0, 0.0),
+            angular=(0.0, 0.0, 0.0),
+            duration_ms=0,
+        )
+        if envelope_error == "WORKSPACE_LIMIT":
+            raise ProtocolError(
+                envelope_error,
+                "current TCP is outside the configured workspace",
+            )
+        if envelope_error == "ORIENTATION_LIMIT":
+            raise ProtocolError(
+                envelope_error,
+                "current TCP orientation is outside the configured envelope",
+            )
         async with self._backend_lock:
             self._assert_command_current(session, lease.lease_id, command_epoch)
             await asyncio.to_thread(self.backend.set_gripper, position)
@@ -888,6 +970,12 @@ class TeleopServer:
                     "command_rate_hz": self.config.safety.command_rate_hz,
                     "workspace_min_m": list(self.config.safety.workspace_min_m),
                     "workspace_max_m": list(self.config.safety.workspace_max_m),
+                    "orientation_configured": self.config.safety.orientation_configured,
+                    "orientation_center_rad": list(self.config.safety.orientation_center_rad),
+                    "orientation_tolerance_rad": list(
+                        self.config.safety.orientation_tolerance_rad
+                    ),
+                    "orientation_gimbal_lock_margin_rad": ORIENTATION_GIMBAL_LOCK_MARGIN_RAD,
                     "joint_min_rad": list(self.config.safety.joint_min_rad),
                     "joint_max_rad": list(self.config.safety.joint_max_rad),
                     "joint_limit_margin_rad": self.config.safety.joint_limit_margin_rad,
@@ -899,10 +987,25 @@ class TeleopServer:
 
     def _require_lease(self, session: ClientSession, body: dict[str, Any]) -> Lease:
         lease_id = require_string(body, "lease_id")
+        if self.leases.expired() is not None:
+            raise ProtocolError("LEASE_EXPIRED", "control lease expired")
         lease = self.leases.renew(session.session_id, lease_id)
         if lease is None:
+            if self.leases.expired() is not None:
+                raise ProtocolError("LEASE_EXPIRED", "control lease expired")
             raise ProtocolError("LEASE_REQUIRED", "a valid control lease is required")
         return lease
+
+    async def _stop_expired_lease(self) -> bool:
+        if self.leases.expired() is None:
+            return False
+        await self._safe_stop(
+            "LEASE_EXPIRED",
+            "control lease expired",
+            revoke=True,
+            stop_recording=True,
+        )
+        return True
 
     async def _maybe_send_lease_status(self, session: ClientSession, *, force: bool) -> None:
         lease = self.leases.current
@@ -1053,14 +1156,7 @@ class TeleopServer:
         interval = max(0.02, self.config.safety.watchdog_ms / 4_000)
         while True:
             await asyncio.sleep(interval)
-            expired = self.leases.expire()
-            if expired is not None:
-                await self._safe_stop(
-                    "LEASE_EXPIRED",
-                    "control lease expired",
-                    revoke=False,
-                    stop_recording=True,
-                )
+            if await self._stop_expired_lease():
                 continue
             if self._motion_active:
                 age_ms = (time.monotonic() - self._last_valid_motion) * 1_000
@@ -1085,6 +1181,20 @@ class TeleopServer:
                         revoke=True,
                         stop_recording=True,
                     )
+                elif self.leases.current is not None or self._motion_active:
+                    envelope_error = self._motion_envelope_error(
+                        snapshot,
+                        linear=(0.0, 0.0, 0.0),
+                        angular=(0.0, 0.0, 0.0),
+                        duration_ms=0,
+                    )
+                    if envelope_error is not None:
+                        await self._safe_stop(
+                            envelope_error,
+                            "robot feedback left the configured TCP motion envelope",
+                            revoke=True,
+                            stop_recording=True,
+                        )
                 now_mono = time.monotonic()
                 state_period_s = 1.0 / self.config.server.state_hz
                 if (
@@ -1134,6 +1244,16 @@ class TeleopServer:
                             "watchdog_ok": watchdog_ok,
                             "base_locked": snapshot.base_locked,
                             "workspace_configured": self.config.safety.workspace_configured,
+                            "orientation_configured": self.config.safety.orientation_configured,
+                            "orientation_center_rad": list(
+                                self.config.safety.orientation_center_rad
+                            ),
+                            "orientation_tolerance_rad": list(
+                                self.config.safety.orientation_tolerance_rad
+                            ),
+                            "orientation_gimbal_lock_margin_rad": (
+                                ORIENTATION_GIMBAL_LOCK_MARGIN_RAD
+                            ),
                         },
                     }
                     async with self._record_lock:
@@ -1195,12 +1315,51 @@ class TeleopServer:
             *snapshot.joint_position_rad,
             *(snapshot.tcp_pose[axis] for axis in ("x", "y", "z", "rx", "ry", "rz")),
         )
-        if self._feedback_signature is None or any(
-            abs(current - previous) > FEEDBACK_CHANGE_EPSILON
-            for current, previous in zip(signature, self._feedback_signature, strict=True)
-        ):
+        previous_signature = self._feedback_signature
+        feedback_changed = previous_signature is None or len(signature) != len(previous_signature)
+        if not feedback_changed and previous_signature is not None:
+            ordinary_end = len(snapshot.joint_position_rad) + 3
+            feedback_changed = any(
+                abs(current - previous) > FEEDBACK_CHANGE_EPSILON
+                for current, previous in zip(
+                    signature[:ordinary_end],
+                    previous_signature[:ordinary_end],
+                    strict=True,
+                )
+            ) or any(
+                abs(shortest_angular_distance_rad(current, previous))
+                > FEEDBACK_CHANGE_EPSILON
+                for current, previous in zip(
+                    signature[ordinary_end:],
+                    previous_signature[ordinary_end:],
+                    strict=True,
+                )
+            )
+        if feedback_changed:
             self._feedback_signature = signature
             self._last_feedback_change_monotonic = time.monotonic()
+
+    def _motion_envelope_error(
+        self,
+        snapshot: RobotSnapshot,
+        *,
+        linear: tuple[float, float, float],
+        angular: tuple[float, float, float],
+        duration_ms: int,
+    ) -> str | None:
+        tcp_xyz = tuple(snapshot.tcp_pose[axis] for axis in ("x", "y", "z"))
+        if not predict_workspace_ok(tcp_xyz, linear, duration_ms, self.config.safety):
+            return "WORKSPACE_LIMIT"
+        if self.config.safety.orientation_configured:
+            tcp_orientation = tuple(snapshot.tcp_pose[axis] for axis in ("rx", "ry", "rz"))
+            if not predict_orientation_ok(
+                tcp_orientation,
+                angular,
+                duration_ms,
+                self.config.safety,
+            ):
+                return "ORIENTATION_LIMIT"
+        return None
 
     def _snapshot_ready(self, snapshot: RobotSnapshot) -> bool:
         return backend_ready(

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import math
 import threading
 import time
 from pathlib import Path
@@ -9,8 +10,10 @@ from websockets.asyncio.client import connect
 import pytest
 
 from lm3_teleop_bridge.backends import RobotSnapshot, SimulatorBackend
+from lm3_teleop_bridge.camera import NullCameraProvider
 from lm3_teleop_bridge.config import (
     AppConfig,
+    CameraConfig,
     RecordingConfig,
     RobotConfig,
     SafetyConfig,
@@ -78,6 +81,7 @@ class _FrozenFeedbackBackend:
     def __init__(self) -> None:
         self.speed_calls = 0
         self.stop_count = 0
+        self.gripper_calls = 0
 
     def snapshot(self) -> RobotSnapshot:
         return RobotSnapshot(
@@ -99,10 +103,48 @@ class _FrozenFeedbackBackend:
         self.stop_count += 1
 
     def set_gripper(self, position_pct: float) -> None:
-        return None
+        self.gripper_calls += 1
 
     def close(self) -> None:
         return None
+
+
+class _MutableFeedbackBackend(_FrozenFeedbackBackend):
+    def __init__(self, tcp_pose: dict[str, float] | None = None) -> None:
+        super().__init__()
+        self.tcp_pose = tcp_pose or {
+            "x": 0.4,
+            "y": 0.0,
+            "z": 0.3,
+            "rx": 0.0,
+            "ry": 3.14,
+            "rz": 0.0,
+        }
+
+    def snapshot(self) -> RobotSnapshot:
+        return RobotSnapshot(
+            robot_state="IDLE",
+            robot_state_code=5,
+            estop_reason="",
+            joint_position_rad=[0.0] * 6,
+            joint_velocity_rad_s=[0.0] * 6,
+            tcp_pose=dict(self.tcp_pose),
+            gripper_pct=50.0,
+            base_locked=True,
+        )
+
+
+class _BlockingSnapshotBackend(_MutableFeedbackBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.snapshot_started = threading.Event()
+        self.release_snapshot = threading.Event()
+
+    def snapshot(self) -> RobotSnapshot:
+        self.snapshot_started.set()
+        if not self.release_snapshot.wait(timeout=2.0):
+            raise TimeoutError("test did not release snapshot")
+        return super().snapshot()
 
 
 class _FailingStopBackend(_FrozenFeedbackBackend):
@@ -119,9 +161,11 @@ class _PoseExecutionFailingBackend(_FrozenFeedbackBackend):
     def __init__(self, failure: str) -> None:
         super().__init__()
         self.failure = failure
+        self.snapshot_calls = 0
 
     def snapshot(self) -> RobotSnapshot:
-        if self.failure == "snapshot":
+        self.snapshot_calls += 1
+        if self.failure == "snapshot" and self.snapshot_calls >= 2:
             raise TimeoutError("pose snapshot failed")
         return super().snapshot()
 
@@ -264,6 +308,11 @@ async def _successful_handshake_first_server_frame_is_welcome_seq_zero(tmp_path:
             first_frame = json.loads(await asyncio.wait_for(websocket.recv(), timeout=2.0))
             assert first_frame["type"] == "session.welcome"
             assert first_frame["seq"] == 0
+            limits = first_frame["body"]["limits"]
+            assert limits["orientation_configured"] is False
+            assert limits["orientation_center_rad"] == [0.0, 0.0, 0.0]
+            assert limits["orientation_tolerance_rad"] == [0.05, 0.05, 0.05]
+            assert limits["orientation_gimbal_lock_margin_rad"] == pytest.approx(0.1)
     finally:
         await server.close()
 
@@ -550,6 +599,274 @@ async def _acquire_requires_official_idle_state(tmp_path: Path) -> None:
     assert response["body"]["reason"] == "robot_must_be_idle_ready_and_base_locked"
 
 
+@pytest.mark.parametrize(
+    ("tcp_pose", "safety"),
+    [
+        (
+            {"x": 0.81, "y": 0.0, "z": 0.3, "rx": 0.0, "ry": 3.14, "rz": 0.0},
+            SafetyConfig(),
+        ),
+        (
+            {"x": 0.4, "y": 0.0, "z": 0.3, "rx": 0.2, "ry": 3.14, "rz": 0.0},
+            SafetyConfig(
+                orientation_configured=True,
+                orientation_center_rad=(0.0, 3.14, 0.0),
+                orientation_tolerance_rad=(0.1, 0.1, 0.1),
+            ),
+        ),
+    ],
+)
+def test_acquire_rejects_robot_outside_motion_envelope(
+    tmp_path: Path,
+    tcp_pose: dict[str, float],
+    safety: SafetyConfig,
+) -> None:
+    async def scenario() -> None:
+        config = AppConfig(
+            robot=RobotConfig(base_locked=True),
+            safety=safety,
+            recording=RecordingConfig(root=tmp_path / "raw", fps=20),
+        )
+        backend = _MutableFeedbackBackend(tcp_pose)
+        server = TeleopServer(config, TOKEN, backend=backend)
+        websocket = _MemoryWebSocket()
+        session = ClientSession(websocket=websocket)  # type: ignore[arg-type]
+        session.authenticated = True
+        session.client_id = "phone"
+        envelope = Envelope(
+            "control.acquire",
+            1,
+            int(time.time() * 1_000),
+            {
+                "requested_lease_ms": 2_000,
+                "operator_hold_ms": 1_500,
+                "safety_ack": {
+                    "base_stationary": True,
+                    "workspace_clear": True,
+                    "estop_accessible": True,
+                    "tool_secure": True,
+                },
+            },
+        )
+
+        await server._control_acquire(session, envelope)
+
+        response = json.loads(websocket.sent[-1])
+        assert response["type"] == "control.status"
+        assert response["body"]["granted"] is False
+        assert response["body"]["reason"] == "robot_not_within_configured_motion_envelope"
+        assert server.leases.current is None
+        assert backend.stop_count == 0
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("tcp_pose", "safety", "expected_code"),
+    [
+        (
+            {"x": 0.81, "y": 0.0, "z": 0.3, "rx": 0.0, "ry": 3.14, "rz": 0.0},
+            SafetyConfig(),
+            "WORKSPACE_LIMIT",
+        ),
+        (
+            {"x": 0.4, "y": 0.0, "z": 0.3, "rx": 0.2, "ry": 3.14, "rz": 0.0},
+            SafetyConfig(
+                orientation_configured=True,
+                orientation_center_rad=(0.0, 3.14, 0.0),
+                orientation_tolerance_rad=(0.1, 0.1, 0.1),
+            ),
+            "ORIENTATION_LIMIT",
+        ),
+    ],
+)
+def test_gripper_rejects_current_tcp_outside_motion_envelope(
+    tmp_path: Path,
+    tcp_pose: dict[str, float],
+    safety: SafetyConfig,
+    expected_code: str,
+) -> None:
+    async def scenario() -> None:
+        config = AppConfig(
+            robot=RobotConfig(base_locked=True),
+            safety=safety,
+            recording=RecordingConfig(root=tmp_path / "raw", fps=20),
+        )
+        backend = _MutableFeedbackBackend(tcp_pose)
+        server = TeleopServer(config, TOKEN, backend=backend)
+        session, websocket, lease_id = _owned_session(server)
+
+        await server._handle_text(
+            session,
+            _message(
+                "gripper.set",
+                1,
+                {
+                    "lease_id": lease_id,
+                    "deadman": True,
+                    "position_pct": 50.0,
+                },
+            ),
+        )
+
+        messages = _decoded_messages(websocket)
+        error = next(message for message in messages if message["type"] == "error")
+        assert error["body"]["code"] == expected_code
+        assert error["body"]["ack_seq"] == 1
+        assert any(
+            message["type"] == "safety.event"
+            and message["body"]["code"] == expected_code
+            for message in messages
+        )
+        assert any(
+            message["type"] == "control.status"
+            and message["body"]["granted"] is False
+            and message["body"]["reason"] == expected_code.lower()
+            for message in messages
+        )
+        assert backend.gripper_calls == 0
+        assert backend.stop_count >= 1
+        assert server.leases.current is None
+
+    asyncio.run(scenario())
+
+
+def test_acquire_cannot_cross_safety_stop_during_snapshot(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        config = AppConfig(
+            robot=RobotConfig(base_locked=True),
+            recording=RecordingConfig(root=tmp_path / "raw", fps=20),
+        )
+        backend = _BlockingSnapshotBackend()
+        server = TeleopServer(config, TOKEN, backend=backend)
+        websocket = _MemoryWebSocket()
+        session = ClientSession(websocket=websocket)  # type: ignore[arg-type]
+        session.authenticated = True
+        session.client_id = "phone"
+        server.sessions = {session.session_id: session}
+        envelope = Envelope(
+            "control.acquire",
+            1,
+            int(time.time() * 1_000),
+            {
+                "requested_lease_ms": 2_000,
+                "operator_hold_ms": 1_500,
+                "safety_ack": {
+                    "base_stationary": True,
+                    "workspace_clear": True,
+                    "estop_accessible": True,
+                    "tool_secure": True,
+                },
+            },
+        )
+
+        acquire_task = asyncio.create_task(server._control_acquire(session, envelope))
+        assert await asyncio.to_thread(backend.snapshot_started.wait, 1.0)
+        await server._safe_stop(
+            "EXTERNAL_STOP",
+            "test stop during readiness snapshot",
+            revoke=True,
+            stop_recording=True,
+        )
+        backend.release_snapshot.set()
+        await acquire_task
+
+        messages = _decoded_messages(websocket)
+        assert server.leases.current is None
+        assert not any(
+            message["type"] == "control.status" and message["body"]["granted"] is True
+            for message in messages
+        )
+        assert any(
+            message["type"] == "control.status"
+            and message["body"]["reason"] == "safety_stop_in_progress"
+            for message in messages
+        )
+
+    asyncio.run(scenario())
+
+
+def test_pose_priming_cannot_write_state_after_concurrent_safety_stop(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = AppConfig(
+            robot=RobotConfig(base_locked=True),
+            recording=RecordingConfig(root=tmp_path / "raw", fps=20),
+        )
+        backend = _BlockingSnapshotBackend()
+        server = TeleopServer(config, TOKEN, backend=backend)
+        session, websocket, lease_id = _owned_session(server)
+
+        priming_task = asyncio.create_task(
+            server._handle_text(
+                session,
+                _message("pose.sample", 1, _pose_body(lease_id)),
+            )
+        )
+        assert await asyncio.to_thread(backend.snapshot_started.wait, 1.0)
+        await server._safe_stop(
+            "EXTERNAL_STOP",
+            "test stop during pose priming snapshot",
+            revoke=True,
+            stop_recording=True,
+        )
+        backend.release_snapshot.set()
+        await priming_task
+
+        messages = _decoded_messages(websocket)
+        assert server.leases.current is None
+        assert server._pose_states == {}
+        assert not any(message["type"] == "ack" for message in messages)
+        error = next(message for message in messages if message["type"] == "error")
+        assert error["body"]["code"] == "LEASE_REQUIRED"
+        assert error["body"]["ack_seq"] == 1
+
+        websocket.sent.clear()
+        await server._handle_text(
+            session,
+            _message(
+                "control.acquire",
+                2,
+                {
+                    "requested_lease_ms": 2_000,
+                    "operator_hold_ms": 1_500,
+                    "safety_ack": {
+                        "base_stationary": True,
+                        "workspace_clear": True,
+                        "estop_accessible": True,
+                        "tool_secure": True,
+                    },
+                },
+            ),
+        )
+        granted = next(
+            message
+            for message in _decoded_messages(websocket)
+            if message["type"] == "control.status" and message["body"]["granted"] is True
+        )
+        new_lease_id = granted["body"]["lease_id"]
+        websocket.sent.clear()
+
+        await server._handle_text(
+            session,
+            _message(
+                "pose.sample",
+                3,
+                _pose_body(new_lease_id, angular_delta_rad=(0.001, 0.0, 0.0)),
+            ),
+        )
+
+        messages = _decoded_messages(websocket)
+        error = next(message for message in messages if message["type"] == "error")
+        assert error["body"]["code"] == "INVALID_MESSAGE"
+        assert "zero angular delta" in error["body"]["message"]
+        assert backend.speed_calls == 0
+        assert server._pose_states == {}
+
+    asyncio.run(scenario())
+
+
 def test_safety_epoch_stops_inflight_command_from_becoming_active(tmp_path: Path) -> None:
     asyncio.run(_safety_epoch_stops_inflight_command_from_becoming_active(tmp_path))
 
@@ -691,6 +1008,23 @@ def test_continuous_motion_with_frozen_feedback_fails_closed(tmp_path: Path) -> 
     asyncio.run(_continuous_motion_with_frozen_feedback_fails_closed(tmp_path))
 
 
+def test_equivalent_euler_wrap_feedback_does_not_refresh_stall_clock(tmp_path: Path) -> None:
+    config = AppConfig(
+        robot=RobotConfig(base_locked=True),
+        recording=RecordingConfig(root=tmp_path / "raw", fps=20),
+    )
+    backend = _MutableFeedbackBackend()
+    server = TeleopServer(config, TOKEN, backend=backend)
+    backend.tcp_pose["rz"] = math.pi
+    server._observe_feedback(backend.snapshot())
+    server._last_feedback_change_monotonic = 123.0
+    backend.tcp_pose["rz"] = -math.pi
+
+    server._observe_feedback(backend.snapshot())
+
+    assert server._last_feedback_change_monotonic == 123.0
+
+
 async def _continuous_motion_with_frozen_feedback_fails_closed(tmp_path: Path) -> None:
     config = AppConfig(
         server=ServerConfig(state_hz=20),
@@ -754,6 +1088,115 @@ async def _continuous_motion_with_frozen_feedback_fails_closed(tmp_path: Path) -
     )
 
 
+def test_state_loop_revokes_lease_when_feedback_leaves_orientation_envelope(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = AppConfig(
+            server=ServerConfig(state_hz=50),
+            robot=RobotConfig(base_locked=True),
+            safety=SafetyConfig(
+                orientation_configured=True,
+                orientation_center_rad=(0.0, 3.14, 0.0),
+                orientation_tolerance_rad=(0.1, 0.1, 0.1),
+            ),
+            recording=RecordingConfig(root=tmp_path / "raw", fps=50),
+        )
+        backend = _MutableFeedbackBackend()
+        server = TeleopServer(config, TOKEN, backend=backend)
+        _, websocket, _ = _owned_session(server)
+        state_task = asyncio.create_task(server._state_loop())
+        try:
+            await asyncio.sleep(0.04)
+            backend.tcp_pose["rx"] = 0.2
+            await asyncio.wait_for(
+                _wait_for_safety_event(websocket, "ORIENTATION_LIMIT"),
+                timeout=1.0,
+            )
+            await asyncio.wait_for(
+                _wait_for_control_reason(websocket, "orientation_limit"),
+                timeout=1.0,
+            )
+        finally:
+            state_task.cancel()
+            await asyncio.gather(state_task, return_exceptions=True)
+
+        messages = _decoded_messages(websocket)
+        assert any(
+            message["type"] == "control.status"
+            and message["body"]["granted"] is False
+            and message["body"]["reason"] == "orientation_limit"
+            for message in messages
+        )
+        assert backend.speed_calls == 0
+        assert backend.stop_count >= 1
+        assert server.leases.current is None
+        assert server._pose_states == {}
+
+    asyncio.run(scenario())
+
+
+def test_recording_audit_includes_orientation_configuration(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        config = AppConfig(
+            server=ServerConfig(state_hz=50),
+            robot=RobotConfig(base_locked=True),
+            safety=SafetyConfig(
+                orientation_configured=True,
+                orientation_center_rad=(0.0, 3.14, 0.0),
+                orientation_tolerance_rad=(0.1, 0.1, 0.1),
+            ),
+            recording=RecordingConfig(root=tmp_path / "raw", fps=50),
+            cameras={"camera_wrist": CameraConfig(source="0", fps=50)},
+        )
+        backend = _MutableFeedbackBackend()
+        server = TeleopServer(
+            config,
+            TOKEN,
+            backend=backend,
+            camera=NullCameraProvider(["camera_wrist"]),
+        )
+        session, _, lease_id = _owned_session(server)
+        await server._recording_start(
+            session,
+            Envelope(
+                "recording.start",
+                1,
+                int(time.time() * 1_000),
+                {
+                    "lease_id": lease_id,
+                    "task": "orientation audit",
+                    "episode_id": "orientation-audit",
+                    "cameras": ["camera_wrist"],
+                },
+            ),
+        )
+        metadata_path = tmp_path / "raw" / "orientation-audit" / "metadata.json"
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        assert metadata["context"]["orientation_configured"] is True
+        assert metadata["context"]["orientation_center_rad"] == [0.0, 3.14, 0.0]
+        assert metadata["context"]["orientation_tolerance_rad"] == [0.1, 0.1, 0.1]
+        assert metadata["context"]["orientation_gimbal_lock_margin_rad"] == pytest.approx(0.1)
+
+        state_task = asyncio.create_task(server._state_loop())
+        try:
+            while server.recorder.status.frame_count < 1:
+                await asyncio.sleep(0.01)
+        finally:
+            state_task.cancel()
+            await asyncio.gather(state_task, return_exceptions=True)
+        await asyncio.to_thread(server.recorder.stop, "operator_stop")
+
+        frame_path = tmp_path / "raw" / "orientation-audit" / "frames.jsonl"
+        frame = json.loads(frame_path.read_text(encoding="utf-8").splitlines()[0])
+        assert frame["safety"]["orientation_configured"] is True
+        assert frame["safety"]["orientation_center_rad"] == [0.0, 3.14, 0.0]
+        assert frame["safety"]["orientation_tolerance_rad"] == [0.1, 0.1, 0.1]
+        assert frame["safety"]["orientation_gimbal_lock_margin_rad"] == pytest.approx(0.1)
+
+    asyncio.run(scenario())
+
+
 async def _wait_for_lease_release(server: TeleopServer) -> None:
     while server.leases.current is not None:
         await asyncio.sleep(0.01)
@@ -762,6 +1205,14 @@ async def _wait_for_lease_release(server: TeleopServer) -> None:
 async def _wait_for_safety_event(websocket: _MemoryWebSocket, code: str) -> None:
     while not any(
         message["type"] == "safety.event" and message["body"]["code"] == code
+        for message in _decoded_messages(websocket)
+    ):
+        await asyncio.sleep(0.01)
+
+
+async def _wait_for_control_reason(websocket: _MemoryWebSocket, reason: str) -> None:
+    while not any(
+        message["type"] == "control.status" and message["body"]["reason"] == reason
         for message in _decoded_messages(websocket)
     ):
         await asyncio.sleep(0.01)
@@ -816,6 +1267,224 @@ def test_pose_sample_first_frame_primes_without_motion(tmp_path: Path) -> None:
         assert ack["body"]["accepted"] is True
         assert ack["body"]["clamped"] is False
         assert "no motion executed" in ack["body"]["detail"]
+
+    asyncio.run(scenario())
+
+
+def test_expired_lease_discovered_by_acquire_clears_pose_and_requires_reprime(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = AppConfig(
+            robot=RobotConfig(base_locked=True),
+            recording=RecordingConfig(root=tmp_path / "raw", fps=20),
+        )
+        backend = _FrozenFeedbackBackend()
+        server = TeleopServer(config, TOKEN, backend=backend)
+        session, websocket, lease_id = _owned_session(server)
+        await _prime_pose(server, session, lease_id)
+        assert server._pose_states
+        assert server.leases.current is not None
+        server.leases.current.expires_monotonic = time.monotonic() - 1.0
+        websocket.sent.clear()
+
+        await server._handle_text(
+            session,
+            _message(
+                "control.acquire",
+                2,
+                {
+                    "requested_lease_ms": 2_000,
+                    "operator_hold_ms": 1_500,
+                    "safety_ack": {
+                        "base_stationary": True,
+                        "workspace_clear": True,
+                        "estop_accessible": True,
+                        "tool_secure": True,
+                    },
+                },
+            ),
+        )
+
+        messages = _decoded_messages(websocket)
+        assert server.leases.current is None
+        assert server._pose_states == {}
+        assert backend.stop_count >= 1
+        assert any(
+            message["type"] == "safety.event"
+            and message["body"]["code"] == "LEASE_EXPIRED"
+            for message in messages
+        )
+        assert not any(
+            message["type"] == "control.status" and message["body"]["granted"] is True
+            for message in messages
+        )
+
+        websocket.sent.clear()
+        await server._handle_text(
+            session,
+            _message(
+                "control.acquire",
+                3,
+                {
+                    "requested_lease_ms": 2_000,
+                    "operator_hold_ms": 1_500,
+                    "safety_ack": {
+                        "base_stationary": True,
+                        "workspace_clear": True,
+                        "estop_accessible": True,
+                        "tool_secure": True,
+                    },
+                },
+            ),
+        )
+        granted = next(
+            message
+            for message in _decoded_messages(websocket)
+            if message["type"] == "control.status" and message["body"]["granted"] is True
+        )
+        new_lease_id = granted["body"]["lease_id"]
+        websocket.sent.clear()
+
+        await server._handle_text(
+            session,
+            _message(
+                "pose.sample",
+                4,
+                _pose_body(new_lease_id, angular_delta_rad=(0.001, 0.0, 0.0)),
+            ),
+        )
+
+        error = next(
+            message for message in _decoded_messages(websocket) if message["type"] == "error"
+        )
+        assert error["body"]["code"] == "INVALID_MESSAGE"
+        assert "zero angular delta" in error["body"]["message"]
+        assert backend.speed_calls == 0
+        assert server._pose_states == {}
+
+    asyncio.run(scenario())
+
+
+def test_motion_with_expired_lease_stops_and_does_not_swallow_expiry(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        config = AppConfig(
+            robot=RobotConfig(base_locked=True),
+            recording=RecordingConfig(root=tmp_path / "raw", fps=20),
+        )
+        backend = _FrozenFeedbackBackend()
+        server = TeleopServer(config, TOKEN, backend=backend)
+        session, websocket, lease_id = _owned_session(server)
+        await _prime_pose(server, session, lease_id)
+        assert server.leases.current is not None
+        server.leases.current.expires_monotonic = time.monotonic() - 1.0
+        websocket.sent.clear()
+
+        await server._handle_text(
+            session,
+            _message(
+                "motion.cartesian_velocity",
+                2,
+                {
+                    "lease_id": lease_id,
+                    "deadman": True,
+                    "frame": "base",
+                    "linear_mps": {"x": 0.01, "y": 0.0, "z": 0.0},
+                    "angular_rps": {"rx": 0.0, "ry": 0.0, "rz": 0.0},
+                    "duration_ms": 100,
+                },
+            ),
+        )
+
+        messages = _decoded_messages(websocket)
+        error = next(message for message in messages if message["type"] == "error")
+        assert error["body"]["code"] == "LEASE_EXPIRED"
+        assert error["body"]["ack_seq"] == 2
+        assert any(
+            message["type"] == "safety.event"
+            and message["body"]["code"] == "LEASE_EXPIRED"
+            for message in messages
+        )
+        assert backend.speed_calls == 0
+        assert backend.stop_count >= 1
+        assert server.leases.current is None
+        assert server._pose_states == {}
+
+    asyncio.run(scenario())
+
+
+def test_watchdog_expiry_clears_pose_before_same_calibration_can_resume(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = AppConfig(
+            robot=RobotConfig(base_locked=True),
+            recording=RecordingConfig(root=tmp_path / "raw", fps=20),
+        )
+        backend = _FrozenFeedbackBackend()
+        server = TeleopServer(config, TOKEN, backend=backend)
+        session, websocket, lease_id = _owned_session(server)
+        await _prime_pose(server, session, lease_id)
+        assert server.leases.current is not None
+        server.leases.current.expires_monotonic = time.monotonic() - 1.0
+        websocket.sent.clear()
+
+        watchdog_task = asyncio.create_task(server._watchdog_loop())
+        try:
+            await asyncio.wait_for(
+                _wait_for_safety_event(websocket, "LEASE_EXPIRED"),
+                timeout=1.0,
+            )
+        finally:
+            watchdog_task.cancel()
+            await asyncio.gather(watchdog_task, return_exceptions=True)
+
+        assert server.leases.current is None
+        assert server._pose_states == {}
+        assert backend.stop_count >= 1
+        websocket.sent.clear()
+        await server._handle_text(
+            session,
+            _message(
+                "control.acquire",
+                2,
+                {
+                    "requested_lease_ms": 2_000,
+                    "operator_hold_ms": 1_500,
+                    "safety_ack": {
+                        "base_stationary": True,
+                        "workspace_clear": True,
+                        "estop_accessible": True,
+                        "tool_secure": True,
+                    },
+                },
+            ),
+        )
+        granted = next(
+            message
+            for message in _decoded_messages(websocket)
+            if message["type"] == "control.status" and message["body"]["granted"] is True
+        )
+        websocket.sent.clear()
+
+        await server._handle_text(
+            session,
+            _message(
+                "pose.sample",
+                3,
+                _pose_body(
+                    granted["body"]["lease_id"],
+                    angular_delta_rad=(0.001, 0.0, 0.0),
+                ),
+            ),
+        )
+
+        error = next(
+            message for message in _decoded_messages(websocket) if message["type"] == "error"
+        )
+        assert error["body"]["code"] == "INVALID_MESSAGE"
+        assert "zero angular delta" in error["body"]["message"]
+        assert backend.speed_calls == 0
 
     asyncio.run(scenario())
 
@@ -963,6 +1632,64 @@ def test_pose_sample_new_calibration_stops_and_primes_without_releasing_lease(
             if message["type"] == "ack" and message["body"]["ack_seq"] == 3
         )
         assert "primed" in ack["body"]["detail"]
+
+    asyncio.run(scenario())
+
+
+def test_pose_sample_priming_after_external_envelope_exit_fails_closed(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = AppConfig(
+            robot=RobotConfig(base_locked=True),
+            safety=SafetyConfig(
+                orientation_configured=True,
+                orientation_center_rad=(0.0, 3.14, 0.0),
+                orientation_tolerance_rad=(0.1, 0.1, 0.1),
+            ),
+            recording=RecordingConfig(root=tmp_path / "raw", fps=20),
+        )
+        backend = _MutableFeedbackBackend()
+        server = TeleopServer(config, TOKEN, backend=backend)
+        session, websocket, lease_id = _owned_session(server)
+        await _prime_pose(server, session, lease_id)
+        assert server._pose_states
+        await asyncio.sleep(MOTION_COMMAND_TEST_SPACING_S)
+        websocket.sent.clear()
+        backend.tcp_pose["rx"] = 0.2
+
+        await server._handle_text(
+            session,
+            _message(
+                "pose.sample",
+                2,
+                _pose_body(
+                    lease_id,
+                    calibration_id="calibration-b",
+                    sensor_timestamp_ms=2_000,
+                ),
+            ),
+        )
+
+        messages = _decoded_messages(websocket)
+        error = next(message for message in messages if message["type"] == "error")
+        assert error["body"]["code"] == "ORIENTATION_LIMIT"
+        assert error["body"]["ack_seq"] == 2
+        assert any(
+            message["type"] == "safety.event"
+            and message["body"]["code"] == "ORIENTATION_LIMIT"
+            for message in messages
+        )
+        assert any(
+            message["type"] == "control.status"
+            and message["body"]["granted"] is False
+            and message["body"]["reason"] == "orientation_limit"
+            for message in messages
+        )
+        assert backend.speed_calls == 0
+        assert backend.stop_count >= 1
+        assert server.leases.current is None
+        assert server._pose_states == {}
 
     asyncio.run(scenario())
 
@@ -1316,6 +2043,113 @@ def test_cartesian_velocity_regression_after_shared_pose_execution_refactor(
         )
         assert ack["body"]["accepted"] is True
         assert ack["body"]["clamped"] is False
+
+    asyncio.run(scenario())
+
+
+def test_cartesian_velocity_current_orientation_limit_fails_closed(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        config = AppConfig(
+            robot=RobotConfig(base_locked=True),
+            safety=SafetyConfig(
+                orientation_configured=True,
+                orientation_center_rad=(0.0, 0.0, 0.0),
+                orientation_tolerance_rad=(0.1, 0.1, 0.1),
+            ),
+            recording=RecordingConfig(root=tmp_path / "raw", fps=20),
+        )
+        backend = _FrozenFeedbackBackend()
+        server = TeleopServer(config, TOKEN, backend=backend)
+        session, websocket, lease_id = _owned_session(server)
+
+        await server._handle_text(
+            session,
+            _message(
+                "motion.cartesian_velocity",
+                1,
+                {
+                    "lease_id": lease_id,
+                    "deadman": True,
+                    "frame": "base",
+                    "linear_mps": {"x": 0.01, "y": 0.0, "z": 0.0},
+                    "angular_rps": {"rx": 0.0, "ry": 0.0, "rz": 0.0},
+                    "duration_ms": 100,
+                },
+            ),
+        )
+
+        messages = _decoded_messages(websocket)
+        error = next(message for message in messages if message["type"] == "error")
+        assert error["body"]["code"] == "ORIENTATION_LIMIT"
+        assert error["body"]["ack_seq"] == 1
+        assert any(
+            message["type"] == "safety.event"
+            and message["body"]["code"] == "ORIENTATION_LIMIT"
+            for message in messages
+        )
+        assert any(
+            message["type"] == "control.status"
+            and message["body"]["granted"] is False
+            and message["body"]["reason"] == "orientation_limit"
+            for message in messages
+        )
+        assert backend.speed_calls == 0
+        assert backend.stop_count >= 1
+        assert server.leases.current is None
+        assert server._pose_states == {}
+
+    asyncio.run(scenario())
+
+
+def test_pose_sample_predicted_orientation_limit_fails_closed(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        config = AppConfig(
+            robot=RobotConfig(base_locked=True),
+            safety=SafetyConfig(
+                orientation_configured=True,
+                orientation_center_rad=(0.0, 3.14, 0.0),
+                orientation_tolerance_rad=(0.01, 0.01, 0.01),
+            ),
+            recording=RecordingConfig(root=tmp_path / "raw", fps=20),
+        )
+        backend = _FrozenFeedbackBackend()
+        server = TeleopServer(config, TOKEN, backend=backend)
+        session, websocket, lease_id = _owned_session(server)
+
+        await _prime_pose(server, session, lease_id)
+        await asyncio.sleep(MOTION_COMMAND_TEST_SPACING_S)
+        await server._handle_text(
+            session,
+            _message(
+                "pose.sample",
+                2,
+                _pose_body(
+                    lease_id,
+                    sensor_timestamp_ms=1_100,
+                    angular_delta_rad=(0.02, 0.0, 0.0),
+                ),
+            ),
+        )
+
+        messages = _decoded_messages(websocket)
+        error = next(message for message in messages if message["type"] == "error")
+        assert error["body"]["code"] == "ORIENTATION_LIMIT"
+        assert error["body"]["ack_seq"] == 2
+        assert any(
+            message["type"] == "safety.event"
+            and message["body"]["code"] == "ORIENTATION_LIMIT"
+            for message in messages
+        )
+        assert any(
+            message["type"] == "control.status"
+            and message["body"]["granted"] is False
+            and message["body"]["reason"] == "orientation_limit"
+            for message in messages
+        )
+        assert backend.speed_calls == 0
+        assert backend.stop_count >= 1
+        assert server.leases.current is None
+        assert server._pose_states == {}
 
     asyncio.run(scenario())
 

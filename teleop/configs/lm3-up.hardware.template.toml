@@ -1,5 +1,5 @@
 # Copy this file to an untracked local config, measure every placeholder, then
-# explicitly set hardware_enabled/base_locked/workspace_configured to true.
+# explicitly set every hardware, base, workspace, orientation, and joint gate to true.
 [server]
 host = "127.0.0.1"
 port = 8765
@@ -38,6 +38,11 @@ workspace_configured = false
 # Replace both bounds with TCP coordinates measured for the actual fixture.
 workspace_min_m = [0.0, 0.0, 0.0]
 workspace_max_m = [0.0, 0.0, 0.0]
+orientation_configured = false
+# Replace with a measured TCP rx/ry/rz center and per-axis tolerances. Tolerances
+# must be positive and no greater than 0.35 rad; smaller site-safe values are preferred.
+orientation_center_rad = [0.0, 0.0, 0.0]
+orientation_tolerance_rad = [0.05, 0.05, 0.05]
 joint_limits_configured = false
 # Replace with manufacturer/现场确认的六轴软限位，单位 rad。
 joint_min_rad = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]

@@ -5,7 +5,7 @@ import secrets
 import time
 from dataclasses import dataclass
 
-from .config import SafetyConfig
+from .config import ORIENTATION_GIMBAL_LOCK_MARGIN_RAD, SafetyConfig
 
 
 @dataclass(slots=True)
@@ -31,7 +31,8 @@ class LeaseManager:
         now: float | None = None,
     ) -> Lease | None:
         current_time = time.monotonic() if now is None else now
-        self.expire(now=current_time)
+        if self.expired(now=current_time) is not None:
+            return None
         if self.current is not None and self.current.session_id != session_id:
             return None
         duration_ms = max(500, min(requested_ms, self.default_lease_ms))
@@ -47,7 +48,8 @@ class LeaseManager:
 
     def renew(self, session_id: str, lease_id: str, *, now: float | None = None) -> Lease | None:
         current_time = time.monotonic() if now is None else now
-        self.expire(now=current_time)
+        if self.expired(now=current_time) is not None:
+            return None
         lease = self.current
         if lease is None or lease.session_id != session_id or lease.lease_id != lease_id:
             return None
@@ -67,9 +69,14 @@ class LeaseManager:
         return released
 
     def expire(self, *, now: float | None = None) -> Lease | None:
+        if self.expired(now=now) is not None:
+            return self.release()
+        return None
+
+    def expired(self, *, now: float | None = None) -> Lease | None:
         current_time = time.monotonic() if now is None else now
         if self.current is not None and self.current.expires_monotonic <= current_time:
-            return self.release()
+            return self.current
         return None
 
     @staticmethod
@@ -125,6 +132,61 @@ def predict_workspace_ok(
         if not (low <= current <= high and low <= future <= high):
             return False
     return True
+
+
+def shortest_angular_distance_rad(angle_rad: float, center_rad: float) -> float:
+    """Return the signed shortest distance from ``center_rad`` to ``angle_rad``."""
+
+    delta = angle_rad - center_rad
+    return math.atan2(math.sin(delta), math.cos(delta))
+
+
+def orientation_within_envelope(
+    orientation_rad: tuple[float, float, float], config: SafetyConfig
+) -> bool:
+    if any(
+        abs(shortest_angular_distance_rad(orientation_rad[1], singularity))
+        <= ORIENTATION_GIMBAL_LOCK_MARGIN_RAD
+        for singularity in (-math.pi / 2, math.pi / 2)
+    ):
+        return False
+    return all(
+        abs(shortest_angular_distance_rad(angle, center)) <= tolerance
+        for angle, center, tolerance in zip(
+            orientation_rad,
+            config.orientation_center_rad,
+            config.orientation_tolerance_rad,
+            strict=True,
+        )
+    )
+
+
+def predict_orientation_ok(
+    orientation_rad: tuple[float, float, float],
+    angular_rps: tuple[float, float, float],
+    duration_ms: int,
+    config: SafetyConfig,
+) -> bool:
+    duration_s = duration_ms / 1_000
+    if not orientation_within_envelope(orientation_rad, config):
+        return False
+    for angle, speed, center, tolerance in zip(
+        orientation_rad,
+        angular_rps,
+        config.orientation_center_rad,
+        config.orientation_tolerance_rad,
+        strict=True,
+    ):
+        current_delta = shortest_angular_distance_rad(angle, center)
+        predicted_delta = current_delta + speed * duration_s
+        if abs(predicted_delta) > tolerance:
+            return False
+    predicted_ry = orientation_rad[1] + angular_rps[1] * duration_s
+    return all(
+        abs(shortest_angular_distance_rad(predicted_ry, singularity))
+        > ORIENTATION_GIMBAL_LOCK_MARGIN_RAD
+        for singularity in (-math.pi / 2, math.pi / 2)
+    )
 
 
 def joints_within_margin(joints: list[float], config: SafetyConfig) -> bool:

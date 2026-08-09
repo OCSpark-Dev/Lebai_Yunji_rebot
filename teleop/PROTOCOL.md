@@ -75,7 +75,13 @@
     "limits": {
       "max_linear_mps": 0.03,
       "max_angular_rps": 0.15,
-      "max_command_duration_ms": 150
+      "max_command_duration_ms": 150,
+      "workspace_min_m": [0.10, -0.60, 0.02],
+      "workspace_max_m": [0.80, 0.60, 0.80],
+      "orientation_configured": true,
+      "orientation_center_rad": [-1.54, 0.03, 1.56],
+      "orientation_tolerance_rad": [0.05, 0.05, 0.05],
+      "orientation_gimbal_lock_margin_rad": 0.10
     }
   }
 }
@@ -106,7 +112,7 @@
 }
 ```
 
-`requested_lease_ms` 最小为 500 ms；服务端配置和协议请求的最大有效值均为 2000 ms，超过上限不会得到更长租约。只有机器人反馈乐白官方状态码 `5 (IDLE)`、无急停、底盘已确认锁定且现场限位配置完整时才会授予租约；状态码 `7 (MOVING)` 不能取得新租约。安全停止执行期间也拒绝新租约。
+`requested_lease_ms` 最小为 500 ms；服务端配置和协议请求的最大有效值均为 2000 ms，超过上限不会得到更长租约。只有机器人反馈乐白官方状态码 `5 (IDLE)`、无急停、底盘已确认锁定、现场限位配置完整，并且当前 TCP XYZ 与 `Rx/Ry/Rz` 都位于已配置运动包络内时才会授予租约；状态码 `7 (MOVING)` 不能取得新租约。安全停止执行期间也拒绝新租约。当前 TCP 不在包络内时返回 `control.status granted=false`，`reason="robot_not_within_configured_motion_envelope"`。
 
 服务端返回：
 
@@ -161,11 +167,15 @@
 
 - 首版只接受 `frame="base"`。
 - 服务端再次钳制线速度、角速度和持续时间，客户端数值不构成安全依据。
-- 预测 TCP 将离开配置工作空间时拒绝命令并停止。
+- 当前或预测 TCP XYZ 将离开配置工作空间时拒绝命令并停止，错误码为 `WORKSPACE_LIMIT`。
+- 当前或预测 TCP `Rx/Ry/Rz` 将离开配置姿态包络时拒绝命令、撤销租约并停止，错误码为 `ORIENTATION_LIMIT`。
+- 持有租约或正在运动时，后台状态反馈一旦离开位置或姿态包络，也立即失败关闭并撤销租约。
 - 300 ms 内未收到新的有效运动命令时调用后端停止。
 - 连续有效的非零运动命令期间，若关节与 TCP 反馈持续无可观测变化超过 `feedback_stall_ms`，撤销租约并停止；该软件检测仍须用真机标定阈值和停机行为。
 - 桥接器不得把连续命令无界堆入乐白异步运动缓冲。
 - UI 松手时立即发送零速和 `motion.stop`，不能等待下一个定时周期。
+
+姿态包络由实测 `orientation_center_rad=[rx,ry,rz]` 和逐轴 `orientation_tolerance_rad` 定义。当前角度与中心的比较使用 `atan2(sin(delta), cos(delta))` 得到跨 `+π/-π` 的最短角距离；预测使用“当前最短角偏差 + 已限幅角速度 × 最终有限命令时长”，预测路径不得在离开包络后靠绕一圈重新进入而被接受。乐白这里的 `Rx/Ry/Rz` 是 Euler ZYX，配置包络和运行时反馈都排除距离 `ry=±π/2` 小于等于 `0.10 rad` 的奇异区。`current Euler + rate * duration` 只是低速、有限小步的保守近似，不是完整 SO(3) 积分、碰撞模型或工具/线缆扫掠证明；真机仍须逐轴低速验证控制器角速度语义。
 
 `motion.stop` 的 `body`：
 
@@ -193,7 +203,7 @@
 }
 ```
 
-`position_pct` 范围为 0–100。夹爪动作同样要求有效租约和 deadman；这里的 deadman 只授权**下发一次目标**。当前已确认的 `motion.stop/stop_move` 只停止机械臂运动，尚未验证能中途停止 LMG-90 夹爪，因此松手、后台或断线不能被解释为夹爪会立即停住。服务端记录命令与实际反馈，不能把“命令已接受”当作“夹爪已到位”；真机启用夹爪前必须验证停止/保持策略、夹持力、间隙和人工解困流程。
+`position_pct` 范围为 0–100。夹爪动作同样要求有效租约、deadman，以及当前 TCP XYZ/姿态仍位于配置运动包络内；越界时不调用夹爪，并按 `WORKSPACE_LIMIT` 或 `ORIENTATION_LIMIT` 停止、撤租。这里的 deadman 只授权**下发一次目标**。当前已确认的 `motion.stop/stop_move` 只停止机械臂运动，尚未验证能中途停止 LMG-90 夹爪，因此松手、后台或断线不能被解释为夹爪会立即停住。服务端记录命令与实际反馈，不能把“命令已接受”当作“夹爪已到位”；真机启用夹爪前必须验证停止/保持策略、夹持力、间隙和人工解困流程。
 
 ## 7. 示范录制
 
@@ -260,7 +270,7 @@
 {"severity":"error","code":"WATCHDOG_TIMEOUT","message":"no valid motion command for 300 ms","action":"stop"}
 ```
 
-常用错误码：`AUTH_FAILED`、`PROTOCOL_MISMATCH`、`INVALID_MESSAGE`、`OUT_OF_ORDER`、`STALE_MESSAGE`、`RATE_LIMITED`、`LEASE_BUSY`、`LEASE_REQUIRED`、`DEADMAN_REQUIRED`、`BASE_NOT_LOCKED`、`ROBOT_NOT_READY`、`WORKSPACE_LIMIT`、`UNSUPPORTED_MODE` 和 `BACKEND_ERROR`。
+常用错误码：`AUTH_FAILED`、`PROTOCOL_MISMATCH`、`INVALID_MESSAGE`、`OUT_OF_ORDER`、`STALE_MESSAGE`、`RATE_LIMITED`、`LEASE_BUSY`、`LEASE_REQUIRED`、`LEASE_EXPIRED`、`DEADMAN_REQUIRED`、`BASE_NOT_LOCKED`、`ROBOT_NOT_READY`、`WORKSPACE_LIMIT`、`ORIENTATION_LIMIT`、`UNSUPPORTED_MODE` 和 `BACKEND_ERROR`。服务端在任一路径发现过期租约时都会先执行统一安全停止、撤租并清除姿态基线；`acquire`/`renew` 不得静默吞掉过期事件。
 
 ## 9. 手机 Rotation Vector 3DoF 增量控制
 
@@ -297,8 +307,8 @@
 - `sensor_timestamp_ms` 是手机启动时钟的正整数。在同一 `calibration_id` 内必须严格递增，相邻已接受样本间隔必须在 `20-150 ms`。
 - `angular_delta_rad` 必须精确包含 `rx/ry/rz` 三个有限数值，单帧范数不得超过 `0.25 rad`；由 `delta / interval` 得到的输入角速度范数不得超过 `6.0 rad/s`。
 - 所有 `pose.sample`，包括 priming 帧，都占用同一个容量为 1 的 20 Hz motion token bucket；不断切换 `calibration_id` 不能绕过限流。
-- 首帧或新 `calibration_id` 必须携带零旋转增量，只建立基线，不调用 `speedl`；非零 priming 会失败关闭。若切换标定时已有运动，桥接器先执行软件停止，保留原租约，再建立新基线。
-- 后续帧将 `X/Y/Z` 强制为零，以传感器间隔作为有限命令时长，再经过与 `motion.cartesian_velocity` 相同的角速度限幅、机器人/关节状态、TCP 工作空间、安全 epoch、watchdog 和反馈停滞检查。默认运行角速度上限仍是安全配置中的 `0.15 rad/s`；`6.0 rad/s` 只是拒绝异常输入的前置上限，不是可执行速度。
+- 首帧或新 `calibration_id` 必须携带零旋转增量，只建立基线，不调用 `speedl`；但桥接器仍会重新读取真机快照并检查当前 XYZ/姿态包络，越界同样失败关闭。非零 priming 会失败关闭。若切换标定时已有运动，桥接器先执行软件停止，保留原租约，再重新检查包络并建立新基线。
+- 后续帧将 `X/Y/Z` 强制为零，以传感器间隔作为有限命令时长，再经过与 `motion.cartesian_velocity` 相同的角速度限幅、机器人/关节状态、TCP 当前/预测工作空间、TCP 当前/预测姿态包络、安全 epoch、watchdog 和反馈停滞检查。默认运行角速度上限仍是安全配置中的 `0.15 rad/s`；`6.0 rad/s` 只是拒绝异常输入的前置上限，不是可执行速度。
 
 任一 schema、deadman、租约、时间、置信度、跳变、限流、安全检查或后端执行错误都会失败关闭：停止机械臂、撤销租约、清除姿态基线，并返回 `error`。低置信度、传感器跳变、页面隐藏、App 后台、松开 DEADMAN 或断连时，客户端也必须立即清除本地基线并尽力发送 `motion.stop`。
 

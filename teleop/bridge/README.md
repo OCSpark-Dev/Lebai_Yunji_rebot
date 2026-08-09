@@ -13,10 +13,11 @@
 - 连续有效的非零笛卡尔命令期间，若关节与 TCP 反馈在配置窗口内持续无可观测变化，则撤租、停止并报告 `FEEDBACK_STALLED`；
 - 过期/未来/乱序消息、非有限数值、错误 deadman、无租约和错误坐标系失败关闭；
 - 速度向量范数钳制、有限持续时间、六轴限位余量和 TCP 当前/预测工作空间检查；
+- 真机必须配置 TCP `Rx/Ry/Rz` 姿态中心和逐轴容差；授予租约、所有笛卡尔速度和每个 `pose.sample` 都按角度环绕后的最短距离检查当前姿态，非 priming 运动还检查按有限命令时长预测的姿态，越界返回 `ORIENTATION_LIMIT` 并走既有撤租/停止路径；
 - 任何已认证的 `motion.stop` 都优先执行，即使其 seq 或 body 随后被判无效；非控制者发起停止时还会撤销当前控制租约，防止原控制端沿用旧租约恢复；
 - 断连、租约过期、机器人状态异常或后端异常会先撤销控制权，再通过独立停止通道请求 `stop_move()`；
 - 不调用 `start_sys()`、`stop_sys()`、解除急停、关机或底盘控制接口；
-- `gripper.set` 的 deadman 只授权一次目标下发；当前没有经真机验证的夹爪中途停止路径，`stop_move` 不能据此视为会停止 LMG-90；
+- `gripper.set` 只在当前 TCP XYZ/姿态位于配置包络内才会下发；它的 deadman 只授权一次目标，当前没有经真机验证的夹爪中途停止路径，`stop_move` 不能据此视为会停止 LMG-90；
 - 原始 episode、相机时间、异常标志和覆盖 episode 全部文件的 `manifest.sha256`；
 - 使用官方 LeRobot v0.4.2 API 的可选 v3 导出器。
 
@@ -43,8 +44,9 @@ $env:LM3_TELEOP_TOKEN = 'replace-with-at-least-16-random-characters'
 - 安装与当前 Python 版本匹配、已经构建完成的 `pylebai` wheel；如果使用 `pylebai_path`，它必须指向可导入 `pylebai` 且包含原生扩展 `l_master` 的构建产物目录，SDK 源码 `python` 目录本身不能直接使用；
 - `base_locked=true` 目前只是启动前由独立底盘流程给出的现场声明，不是持续读取的 UP 硬件互锁；真机接入前必须补独立确定性互锁与状态刷新；
 - `workspace_min_m`/`workspace_max_m` 是实际工具、夹具和场景下测得的 TCP 界限；
+- `orientation_center_rad`/`orientation_tolerance_rad` 是当前 TCP 姿态的实测安全包络；逐轴容差必须大于 0 且不超过 `0.35 rad`，并完成工具、夹爪、相机和线缆的完整旋转扫掠验证；
 - `joint_min_rad`/`joint_max_rad` 是厂商/现场确认的六轴软限位，并保留安全余量；
-- `workspace_configured=true`、`joint_limits_configured=true`、`hardware_enabled=true`；
+- `workspace_configured=true`、`orientation_configured=true`、`joint_limits_configured=true`、`hardware_enabled=true`；
 - 现场人员已上使能、检查急停并掌握物理急停。
 
 然后仍必须传 `--hardware`。如果监听局域网，还要配置 `allow_lan=true` 并传 `--allow-lan`。桥接器不会替操作者上使能或复位急停。

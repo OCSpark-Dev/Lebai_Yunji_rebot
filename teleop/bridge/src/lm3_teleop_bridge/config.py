@@ -10,6 +10,10 @@ from pathlib import Path
 from typing import Any
 
 
+MAX_ORIENTATION_TOLERANCE_RAD = 0.35
+ORIENTATION_GIMBAL_LOCK_MARGIN_RAD = 0.10
+
+
 class ConfigError(ValueError):
     """Raised when a configuration would weaken a required safety invariant."""
 
@@ -52,6 +56,9 @@ class SafetyConfig:
     workspace_configured: bool = False
     workspace_min_m: tuple[float, float, float] = (0.10, -0.60, 0.02)
     workspace_max_m: tuple[float, float, float] = (0.80, 0.60, 0.80)
+    orientation_configured: bool = False
+    orientation_center_rad: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    orientation_tolerance_rad: tuple[float, float, float] = (0.05, 0.05, 0.05)
     joint_limits_configured: bool = False
     joint_min_rad: tuple[float, ...] = (-6.283, -6.283, -6.283, -6.283, -6.283, -6.283)
     joint_max_rad: tuple[float, ...] = (6.283, 6.283, 6.283, 6.283, 6.283, 6.283)
@@ -104,6 +111,8 @@ class AppConfig:
             raise ConfigError("server.port must be between 1 and 65535")
         if not isinstance(self.server.path, str) or not self.server.path.startswith("/"):
             raise ConfigError("server.path must start with '/'")
+        if not isinstance(self.server.allow_lan, bool):
+            raise ConfigError("server.allow_lan must be boolean")
         if not _is_int(self.server.state_hz) or not (1 <= self.server.state_hz <= 50):
             raise ConfigError("server.state_hz must be between 1 and 50")
         if not _is_int(self.server.max_message_age_ms) or self.server.max_message_age_ms <= 0:
@@ -146,6 +155,8 @@ class AppConfig:
             <= 150
         ):
             raise ConfigError("command duration bounds must fit within 1..150 ms")
+        if not isinstance(self.safety.workspace_configured, bool):
+            raise ConfigError("safety.workspace_configured must be boolean")
         if len(self.safety.workspace_min_m) != 3 or len(self.safety.workspace_max_m) != 3:
             raise ConfigError("workspace bounds must each contain three values")
         if not _all_finite((*self.safety.workspace_min_m, *self.safety.workspace_max_m)):
@@ -157,6 +168,37 @@ class AppConfig:
             )
         ):
             raise ConfigError("each workspace minimum must be below its maximum")
+        if not isinstance(self.safety.orientation_configured, bool):
+            raise ConfigError("safety.orientation_configured must be boolean")
+        if len(self.safety.orientation_center_rad) != 3 or len(
+            self.safety.orientation_tolerance_rad
+        ) != 3:
+            raise ConfigError("orientation center and tolerance must each contain three values")
+        if not _all_finite(
+            (*self.safety.orientation_center_rad, *self.safety.orientation_tolerance_rad)
+        ):
+            raise ConfigError("orientation center and tolerance must contain only finite numbers")
+        if any(
+            tolerance <= 0 or tolerance > MAX_ORIENTATION_TOLERANCE_RAD
+            for tolerance in self.safety.orientation_tolerance_rad
+        ):
+            raise ConfigError(
+                "orientation tolerances must be positive and no greater than "
+                f"{MAX_ORIENTATION_TOLERANCE_RAD} rad per axis"
+            )
+        center_ry = self.safety.orientation_center_rad[1]
+        tolerance_ry = self.safety.orientation_tolerance_rad[1]
+        if any(
+            abs(_shortest_angular_distance(center_ry, singularity))
+            <= tolerance_ry + ORIENTATION_GIMBAL_LOCK_MARGIN_RAD
+            for singularity in (-math.pi / 2, math.pi / 2)
+        ):
+            raise ConfigError(
+                "the configured ry orientation envelope must stay at least "
+                f"{ORIENTATION_GIMBAL_LOCK_MARGIN_RAD} rad away from +/-pi/2"
+            )
+        if not isinstance(self.safety.joint_limits_configured, bool):
+            raise ConfigError("safety.joint_limits_configured must be boolean")
         if len(self.safety.joint_min_rad) != 6 or len(self.safety.joint_max_rad) != 6:
             raise ConfigError("joint bounds must each contain six values")
         if not _all_finite((*self.safety.joint_min_rad, *self.safety.joint_max_rad)):
@@ -229,6 +271,8 @@ class AppConfig:
                 raise ConfigError("hardware mode requires a measured TCP workspace")
             if not self.safety.joint_limits_configured:
                 raise ConfigError("hardware mode requires measured joint limits")
+            if not self.safety.orientation_configured:
+                raise ConfigError("hardware mode requires a measured TCP orientation envelope")
 
         for name, camera in self.cameras.items():
             if re.fullmatch(r"camera_[A-Za-z0-9_-]+", name) is None:
@@ -265,6 +309,8 @@ def load_config(path: str | Path) -> AppConfig:
     for key in (
         "workspace_min_m",
         "workspace_max_m",
+        "orientation_center_rad",
+        "orientation_tolerance_rad",
         "joint_min_rad",
         "joint_max_rad",
         "allowed_robot_states",
@@ -347,3 +393,8 @@ def _is_finite_positive(value: Any) -> bool:
 
 def _all_finite(values: tuple[Any, ...]) -> bool:
     return all(_is_finite_number(value) for value in values)
+
+
+def _shortest_angular_distance(angle_rad: float, center_rad: float) -> float:
+    delta = angle_rad - center_rad
+    return math.atan2(math.sin(delta), math.cos(delta))
