@@ -158,7 +158,9 @@ class ProtocolCodec(
         val sentAtMs = envelope.requiredLong("sent_at_ms")
         if (sentAtMs < 0L) throw ProtocolException("invalid sent_at_ms")
         val body = envelope.optJSONObject("body") ?: throw ProtocolException("body must be an object")
-        if (!welcomeReceived && (type != "session.welcome" || seq != 0L)) {
+        val isInitialWelcome = type == "session.welcome" && seq == 0L
+        val isInitialServerError = type == "error" && seq == 0L
+        if (!welcomeReceived && !isInitialWelcome && !isInitialServerError) {
             throw ProtocolException("first server frame must be session.welcome with seq=0")
         }
         if (welcomeReceived && type == "session.welcome") {

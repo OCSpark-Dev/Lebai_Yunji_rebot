@@ -146,7 +146,7 @@ class MainActivity : Activity() {
                 return@setOnClickListener
             }
             val clientName = binding.clientNameInput.text.toString().trim()
-            val token = binding.tokenInput.text.toString()
+            val token = binding.tokenInput.text.toString().trim()
             if (clientName.isBlank()) {
                 showMessage("请输入操作者或终端名称")
                 return@setOnClickListener

@@ -102,6 +102,25 @@ class ProtocolCodecTest {
     }
 
     @Test
+    fun initialServerErrorPreservesAuthenticationFailure() {
+        val parsed = ProtocolCodec().parse(
+            envelope(
+                seq = 0,
+                type = "error",
+                body = JSONObject()
+                    .put("ack_seq", 0)
+                    .put("code", "AUTH_FAILED")
+                    .put("message", "authentication failed")
+                    .put("recoverable", false),
+            ),
+        ) as ServerMessage.Error
+
+        assertEquals("AUTH_FAILED", parsed.code)
+        assertEquals("authentication failed", parsed.message)
+        assertFalse(parsed.recoverable)
+    }
+
+    @Test
     fun repeatedWelcomeFailsEvenWithIncreasingSequence() {
         val codec = ProtocolCodec()
         codec.parse(welcomeEnvelope())

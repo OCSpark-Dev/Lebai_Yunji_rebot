@@ -66,8 +66,15 @@ $checks['envelope requires integer seq and timestamp'] = (
 $checks['envelope requires object body'] = (
   $protocol.Contains('!isBodyObject(envelope.body)')
 )
-$checks['first server frame is canonical welcome seq zero'] = (
-  $client.Contains("envelope.seq !== 0 || envelope.type !== 'session.welcome'")
+$checks['pre-welcome error seq zero is strictly validated surfaced and closed'] = (
+  $client.Contains("envelope.seq === 0 && envelope.type === 'error'") -and
+  $client.Contains('const preWelcomeError = validateErrorBody(envelope.body);') -and
+  $client.Contains("this.closeSocket('invalid_pre_welcome_error_body', false)") -and
+  $client.Contains('this.closeSocket(`server_error:${preWelcomeError.code}:${preWelcomeError.message}`, false)')
+)
+$checks['other first server frames still require canonical welcome seq zero'] = (
+  $client.Contains("envelope.seq !== 0 || envelope.type !== 'session.welcome'") -and
+  $client.Contains("failClosed('first_server_message_must_be_session_welcome_seq_0', true)")
 )
 $checks['noncanonical welcome alias is rejected'] = (
   -not $client.Contains("envelope.type === 'welcome'")

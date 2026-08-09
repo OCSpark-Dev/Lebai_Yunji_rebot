@@ -616,6 +616,15 @@ export class TeleopClient {
       return;
     }
     if (this.lastServerSeq < 0) {
+      if (envelope.seq === 0 && envelope.type === 'error') {
+        const preWelcomeError = validateErrorBody(envelope.body);
+        if (preWelcomeError === undefined) {
+          this.closeSocket('invalid_pre_welcome_error_body', false);
+          return;
+        }
+        this.closeSocket(`server_error:${preWelcomeError.code}:${preWelcomeError.message}`, false);
+        return;
+      }
       if (envelope.seq !== 0 || envelope.type !== 'session.welcome') {
         this.failClosed('first_server_message_must_be_session_welcome_seq_0', true);
         return;

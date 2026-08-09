@@ -22,6 +22,8 @@ from lm3_teleop_bridge.server import ClientSession, TeleopServer
 
 
 TOKEN = "test-token-0123456789"
+# The 20 Hz bucket refills every 50 ms; functional tests keep scheduler margin.
+MOTION_COMMAND_TEST_SPACING_S = 0.10
 
 
 class _MemoryWebSocket:
@@ -218,8 +220,94 @@ async def _receive_type(websocket, expected: str, timeout: float = 2.0) -> dict:
             value = json.loads(await websocket.recv())
             if value["type"] == expected:
                 return value
+            if value["type"] == "error":
+                raise AssertionError(
+                    f"expected server frame {expected!r}, received protocol error: {value!r}"
+                )
 
     return await asyncio.wait_for(receive(), timeout)
+
+
+def test_successful_handshake_first_server_frame_is_welcome_seq_zero(tmp_path: Path) -> None:
+    asyncio.run(_successful_handshake_first_server_frame_is_welcome_seq_zero(tmp_path))
+
+
+async def _successful_handshake_first_server_frame_is_welcome_seq_zero(tmp_path: Path) -> None:
+    config = AppConfig(
+        server=ServerConfig(host="127.0.0.1", port=0, state_hz=50),
+        robot=RobotConfig(base_locked=True),
+        recording=RecordingConfig(root=tmp_path / "raw", fps=50),
+    )
+    server = TeleopServer(
+        config,
+        TOKEN,
+        backend=SimulatorBackend(config.robot),
+        allow_ephemeral_port=True,
+    )
+    await server.start()
+    try:
+        async with connect(f"ws://127.0.0.1:{server.bound_port}/ws") as websocket:
+            await websocket.send(
+                _message(
+                    "session.hello",
+                    0,
+                    {
+                        "client_id": "android-first-frame-test",
+                        "client_name": "pytest",
+                        "platform": "android",
+                        "app_version": "0.1.0",
+                        "auth_token": TOKEN,
+                        "capabilities": ["cartesian_velocity"],
+                    },
+                )
+            )
+            first_frame = json.loads(await asyncio.wait_for(websocket.recv(), timeout=2.0))
+            assert first_frame["type"] == "session.welcome"
+            assert first_frame["seq"] == 0
+    finally:
+        await server.close()
+
+
+def test_failed_authentication_first_server_frame_is_auth_error_seq_zero(tmp_path: Path) -> None:
+    asyncio.run(_failed_authentication_first_server_frame_is_auth_error_seq_zero(tmp_path))
+
+
+async def _failed_authentication_first_server_frame_is_auth_error_seq_zero(tmp_path: Path) -> None:
+    config = AppConfig(
+        server=ServerConfig(host="127.0.0.1", port=0, state_hz=50),
+        robot=RobotConfig(base_locked=True),
+        recording=RecordingConfig(root=tmp_path / "raw", fps=50),
+    )
+    server = TeleopServer(
+        config,
+        TOKEN,
+        backend=SimulatorBackend(config.robot),
+        allow_ephemeral_port=True,
+    )
+    await server.start()
+    try:
+        async with connect(f"ws://127.0.0.1:{server.bound_port}/ws") as websocket:
+            await websocket.send(
+                _message(
+                    "session.hello",
+                    0,
+                    {
+                        "client_id": "android-auth-failure-test",
+                        "client_name": "pytest",
+                        "platform": "android",
+                        "app_version": "0.1.0",
+                        "auth_token": "wrong-token-0123456789",
+                        "capabilities": ["cartesian_velocity"],
+                    },
+                )
+            )
+            first_frame = json.loads(await asyncio.wait_for(websocket.recv(), timeout=2.0))
+            assert first_frame["type"] == "error"
+            assert first_frame["seq"] == 0
+            assert first_frame["body"]["code"] == "AUTH_FAILED"
+            assert first_frame["body"]["ack_seq"] == 0
+    finally:
+        await server.close()
 
 
 def test_full_simulator_lease_motion_and_watchdog(tmp_path: Path) -> None:
@@ -357,7 +445,7 @@ async def _pose_sample_websocket_e2e_controls_only_tcp_orientation(tmp_path: Pat
             assert priming_ack["body"]["ack_type"] == "pose.sample"
             assert "no motion executed" in priming_ack["body"]["detail"]
             assert backend.last_command is None
-            await asyncio.sleep(0.06)
+            await asyncio.sleep(MOTION_COMMAND_TEST_SPACING_S)
 
             await websocket.send(
                 _message(
@@ -646,7 +734,7 @@ async def _continuous_motion_with_frozen_feedback_fails_closed(tmp_path: Path) -
             except ProtocolError as error:
                 assert error.code == "LEASE_REQUIRED"
                 break
-            await asyncio.sleep(0.06)
+            await asyncio.sleep(MOTION_COMMAND_TEST_SPACING_S)
         await asyncio.wait_for(_wait_for_lease_release(server), timeout=1.0)
         await asyncio.wait_for(
             _wait_for_safety_event(websocket, "FEEDBACK_STALLED"), timeout=1.0
@@ -776,7 +864,7 @@ def test_pose_sample_second_frame_drives_only_clamped_tcp_rotation(tmp_path: Pat
         server = TeleopServer(config, TOKEN, backend=backend)
         session, websocket, lease_id = _owned_session(server)
         await _prime_pose(server, session, lease_id)
-        await asyncio.sleep(0.06)
+        await asyncio.sleep(MOTION_COMMAND_TEST_SPACING_S)
 
         await server._handle_text(
             session,
@@ -830,7 +918,7 @@ def test_pose_sample_new_calibration_stops_and_primes_without_releasing_lease(
         server = TeleopServer(config, TOKEN, backend=backend)
         session, websocket, lease_id = _owned_session(server)
         await _prime_pose(server, session, lease_id)
-        await asyncio.sleep(0.06)
+        await asyncio.sleep(MOTION_COMMAND_TEST_SPACING_S)
         await server._handle_text(
             session,
             _message(
@@ -845,7 +933,7 @@ def test_pose_sample_new_calibration_stops_and_primes_without_releasing_lease(
         )
         assert backend.speed_calls == 1
         assert server._motion_active is True
-        await asyncio.sleep(0.06)
+        await asyncio.sleep(MOTION_COMMAND_TEST_SPACING_S)
 
         await server._handle_text(
             session,
@@ -1154,7 +1242,7 @@ def test_pose_sample_execution_errors_stop_revoke_and_clear_state(
         server = TeleopServer(config, TOKEN, backend=backend)
         session, websocket, lease_id = _owned_session(server)
         await _prime_pose(server, session, lease_id)
-        await asyncio.sleep(0.06)
+        await asyncio.sleep(MOTION_COMMAND_TEST_SPACING_S)
         websocket.sent.clear()
 
         await server._handle_text(

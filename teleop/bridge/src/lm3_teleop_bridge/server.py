@@ -427,7 +427,6 @@ class TeleopServer:
             )
             await session.websocket.close(code=1008, reason="authentication failed")
             return
-        session.authenticated = True
         session.client_id = client_id
         session.client_name = client_name
         session.platform = platform
@@ -453,6 +452,7 @@ class TeleopServer:
                 },
             },
         )
+        session.authenticated = True
         snapshot = await self._read_snapshot()
         await session.send(
             "robot.state",

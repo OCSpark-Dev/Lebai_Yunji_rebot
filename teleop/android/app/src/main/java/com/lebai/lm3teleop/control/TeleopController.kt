@@ -424,6 +424,7 @@ class TeleopController(
     override fun onServerMessage(message: ServerMessage) {
         var forceStopReason: String? = null
         var releaseLease = false
+        var preWelcomeError = false
         synchronized(lock) {
             when (message) {
                 is ServerMessage.Welcome -> {
@@ -434,6 +435,7 @@ class TeleopController(
                         commandRateHz = message.commandRateHz,
                         watchdogMs = message.watchdogMs,
                     )
+                    transportDetail = if (protocolCompatible) "协议已就绪" else "服务端安全参数不兼容"
                     lastEvent = if (protocolCompatible) {
                         "认证成功，会话 ${message.sessionId}"
                     } else {
@@ -538,7 +540,14 @@ class TeleopController(
                     val poseCommandFailed = message.ackSeq?.let(pendingPoseSequences::remove) == true
                     lastEvent = "${message.code}: ${message.message}"
                     lastEventSeverity = "error"
-                    if (!message.recoverable || poseCommandFailed) {
+                    if (welcome == null && message.seq == 0L) {
+                        preWelcomeError = true
+                        protocolFailureHandled = true
+                        transportState = TransportState.FAILED
+                        transportDetail = lastEvent
+                        lastEvent = "$lastEvent；连接已强制关闭"
+                        resetSessionLocked()
+                    } else if (!message.recoverable || poseCommandFailed) {
                         forceStopReason = "nonrecoverable_error_${message.code}"
                         releaseLease = true
                     }
@@ -556,7 +565,10 @@ class TeleopController(
             }
         }
 
-        if (forceStopReason != null) {
+        if (preWelcomeError) {
+            socket.cancelNow()
+            publish()
+        } else if (forceStopReason != null) {
             forceSafetyStop(forceStopReason!!, releaseLease, stopRecording = true)
         } else {
             publish()

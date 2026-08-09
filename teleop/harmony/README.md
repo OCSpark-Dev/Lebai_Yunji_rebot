@@ -92,7 +92,7 @@ $env:Path="$env:JAVA_HOME\bin;$env:NODE_HOME;C:\Program Files\Huawei\DevEco Stud
 }
 ```
 
-服务端首帧必须严格为 `session.welcome` 且 `seq=0`；之后同一方向、同一连接内的 `seq` 必须严格递增，重复 welcome 或 welcome 前的其他消息都会失败关闭。客户端只接受文本帧，并在分派前验证信封以及每一种服务端消息的必填字段、布尔类型、整数时间戳、有限数值、六维关节/TCP 数据和夹爪范围；非法消息、重复/倒退序号、未知消息类型和二进制消息都会失败关闭。
+正常认证时，服务端首帧必须严格为 `session.welcome` 且 `seq=0`。认证或握手被拒绝时，唯一允许的 welcome 前例外是 `error seq=0`：客户端会严格校验必填的 `code`、`message`、`recoverable`，并在可选 `ack_seq` 存在时校验其整数类型，再显示服务端的真实 `code/message` 并关闭连接；该错误帧不会建立会话。其他 welcome 前消息仍会被拒绝。welcome 之后同一方向、同一连接内的 `seq` 必须严格递增，重复 welcome 也会失败关闭。客户端只接受文本帧，并在分派前验证信封以及每一种服务端消息的必填字段、布尔类型、整数时间戳、有限数值、六维关节/TCP 数据和夹爪范围；非法消息、重复/倒退序号、未知消息类型和二进制消息都会失败关闭。
 
 客户端发送：
 

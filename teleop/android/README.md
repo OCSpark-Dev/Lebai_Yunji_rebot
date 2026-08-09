@@ -32,6 +32,10 @@
 
 填写 WebSocket 地址、终端名称和共享 token。token 只放在 `session.hello.body.auth_token` 中，客户端不会写入 SharedPreferences、日志或 URL；退出进程后需要重新输入。
 
+- 客户端会去掉粘贴 token 时意外带入的首尾空白。
+- 服务端若在 welcome 前返回 `error seq=0`（例如 `AUTH_FAILED`），客户端会显示真实错误码和消息并失败关闭；其他非 `session.welcome seq=0` 首帧仍视为协议错误。
+- `STALE_MESSAGE` 表示手机与网关墙钟偏差或网络延迟超过服务端配置；应先让两端自动校时并复测，不要为真机随意放宽消息时效限制。
+
 - release 构建只允许 `wss://`。
 - debug 构建为了局域网开发允许明文，但应用层只接受环回、RFC1918、链路本地、无点局域网主机名或 `.local` 主机的 `ws://`。
 - 明文规则不是安全边界。生产环境应在隔离控制网内使用 WSS、正确校验证书，并由服务端执行 token 校验、单写入者租约、动作限幅、工作空间/碰撞检查和看门狗。
