@@ -46,6 +46,34 @@ class _FakeRobot:
         return SimpleNamespace(force=20.0, amplitude=42.0, hold_on=True)
 
 
+class _FakeNative:
+    def __init__(self) -> None:
+        self.get_kin_data_calls = 0
+
+    def get_kin_data(self) -> object:
+        self.get_kin_data_calls += 1
+        return SimpleNamespace(
+            actual_joint_pose=[0.2] * 6,
+            actual_joint_speed=[0.01] * 6,
+            actual_tcp_pose=_TcpProxy(),
+        )
+
+
+class _FastFakeRobot(_FakeRobot):
+    def __init__(self, ip: str, simulator: bool) -> None:
+        super().__init__(ip, simulator)
+        self.native = _FakeNative()
+
+    def get_actual_joint_positions(self) -> list[float]:
+        raise AssertionError("fast snapshot must use native.get_kin_data")
+
+    def get_actual_joint_speed(self) -> list[float]:
+        raise AssertionError("fast snapshot must use native.get_kin_data")
+
+    def get_actual_tcp_pose(self) -> _TcpProxy:
+        raise AssertionError("fast snapshot must use native.get_kin_data")
+
+
 def test_hardware_snapshot_accepts_swig_proxy_and_clawdata(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         backends.importlib,
@@ -60,6 +88,24 @@ def test_hardware_snapshot_accepts_swig_proxy_and_clawdata(monkeypatch: pytest.M
     assert snapshot.robot_state_code == 7
     assert snapshot.tcp_pose["x"] == pytest.approx(0.4)
     assert snapshot.gripper_pct == pytest.approx(42.0)
+
+
+def test_hardware_snapshot_uses_single_native_kin_data_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        backends.importlib,
+        "import_module",
+        lambda name: SimpleNamespace(Robot=_FastFakeRobot),
+    )
+    backend = HardwareBackend(RobotConfig(robot_ip="192.0.2.10", base_locked=True))
+
+    snapshot = backend.snapshot()
+
+    assert backend._robot.native.get_kin_data_calls == 1  # type: ignore[attr-defined]
+    assert snapshot.joint_position_rad == pytest.approx([0.2] * 6)
+    assert snapshot.joint_velocity_rad_s == pytest.approx([0.01] * 6)
+    assert snapshot.tcp_pose["x"] == pytest.approx(0.4)
 
 
 def test_hardware_import_error_requires_built_artifact(monkeypatch: pytest.MonkeyPatch) -> None:

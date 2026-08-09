@@ -127,6 +127,118 @@ class TeleopControllerConcurrencyTest {
     }
 
     @Test
+    fun matchingAckReleasesTheOnlyMotionCreditAndSchedulesLatestInput() {
+        val scheduler = Executors.newSingleThreadScheduledExecutor()
+        lateinit var transport: CapturingMotionTransport
+        val controller = TeleopController(
+            clientId = "client-1",
+            appVersion = "test",
+            listener = {},
+            scheduler = scheduler,
+            transportFactory = { listener ->
+                CapturingMotionTransport(listener).also { transport = it }
+            },
+        )
+
+        try {
+            establishLease(controller, transport.listener)
+            assertTrue(controller.startMotion(AxisDirection.X_POS, SpeedGear.CREEP))
+            assertTrue(awaitVelocityCount(transport, 1))
+            val firstSequence = transport.frames.first { it.second == "motion.cartesian_velocity" }.first
+
+            Thread.sleep(80L)
+            assertEquals(1, transport.velocityCount())
+            controller.onServerMessage(
+                ServerMessage.Ack(
+                    seq = 3L,
+                    sentAtMs = 5_003L,
+                    ackSeq = firstSequence,
+                    ackType = "pose.sample",
+                    accepted = true,
+                    clamped = false,
+                    detail = "wrong type",
+                ),
+            )
+            Thread.sleep(60L)
+            assertEquals(1, transport.velocityCount())
+
+            controller.onServerMessage(
+                ServerMessage.Ack(
+                    seq = 4L,
+                    sentAtMs = 5_004L,
+                    ackSeq = firstSequence,
+                    ackType = "motion.cartesian_velocity",
+                    accepted = true,
+                    clamped = false,
+                    detail = "accepted",
+                ),
+            )
+            assertTrue(awaitVelocityCount(transport, 2))
+        } finally {
+            controller.stopMotion("test_complete")
+            scheduler.shutdownNow()
+        }
+    }
+
+    @Test
+    fun stopBypassesCreditAndOldAckCannotUnlockTheNewGeneration() {
+        val scheduler = Executors.newSingleThreadScheduledExecutor()
+        lateinit var transport: CapturingMotionTransport
+        val controller = TeleopController(
+            clientId = "client-1",
+            appVersion = "test",
+            listener = {},
+            scheduler = scheduler,
+            transportFactory = { listener ->
+                CapturingMotionTransport(listener).also { transport = it }
+            },
+        )
+
+        try {
+            establishLease(controller, transport.listener)
+            assertTrue(controller.startMotion(AxisDirection.X_POS, SpeedGear.CREEP))
+            assertTrue(awaitVelocityCount(transport, 1))
+            val oldSequence = transport.frames.first { it.second == "motion.cartesian_velocity" }.first
+
+            controller.stopMotion("operator_release")
+            assertTrue(transport.frames.any { it.second == "motion.stop" })
+            assertTrue(controller.startMotion(AxisDirection.Y_POS, SpeedGear.CREEP))
+            assertTrue(awaitVelocityCount(transport, 2))
+            val newSequence = transport.frames.filter { it.second == "motion.cartesian_velocity" }[1].first
+
+            controller.onServerMessage(
+                ServerMessage.Ack(
+                    seq = 3L,
+                    sentAtMs = 5_003L,
+                    ackSeq = oldSequence,
+                    ackType = "motion.cartesian_velocity",
+                    accepted = true,
+                    clamped = false,
+                    detail = "old generation",
+                ),
+            )
+            Thread.sleep(80L)
+            assertEquals(2, transport.velocityCount())
+
+            controller.onServerMessage(
+                ServerMessage.Ack(
+                    seq = 4L,
+                    sentAtMs = 5_004L,
+                    ackSeq = newSequence,
+                    ackType = "motion.cartesian_velocity",
+                    accepted = true,
+                    clamped = false,
+                    detail = "current generation",
+                ),
+            )
+            assertTrue(awaitVelocityCount(transport, 3))
+        } finally {
+            controller.stopMotion("test_complete")
+            scheduler.shutdownNow()
+        }
+    }
+
+    @Test
     fun repeatedProtocolFailureIsHandledOnlyOnce() {
         val scheduler = Executors.newSingleThreadScheduledExecutor()
         lateinit var transport: BlockingTransport
@@ -205,6 +317,81 @@ class TeleopControllerConcurrencyTest {
         } finally {
             scheduler.shutdownNow()
         }
+    }
+
+    private fun establishLease(controller: TeleopController, listener: TeleopTransportListener) {
+        controller.connect("wss://robot.example.com/teleop", "phone")
+        listener.onTransportState(TransportState.OPEN, "open")
+        listener.onServerMessage(
+            ServerMessage.Welcome(
+                seq = 0L,
+                sentAtMs = 5_000L,
+                sessionId = "session-1",
+                serverTimeMs = 5_000L,
+                mode = "teleop",
+                watchdogMs = 300,
+                commandRateHz = 20,
+                limitsJson = "{}",
+                baseLocked = true,
+            ),
+        )
+        listener.onServerMessage(
+            ServerMessage.RobotState(
+                seq = 1L,
+                sentAtMs = 5_001L,
+                robotState = "IDLE",
+                estopReason = null,
+                jointPositionRad = List(6) { 0.0 },
+                jointVelocityRadS = List(6) { 0.0 },
+                tcpPoseJson = "{}",
+                gripperPct = 50.0,
+                baseLocked = true,
+                watchdogOk = true,
+                recording = false,
+            ),
+        )
+        controller.updateChecklist(checkedSafety)
+        listener.onServerMessage(
+            ServerMessage.ControlStatus(
+                seq = 2L,
+                sentAtMs = 5_002L,
+                granted = true,
+                leaseId = "lease-1",
+                ownerClientId = "client-1",
+                expiresAtMs = 7_000L,
+                reason = null,
+            ),
+        )
+    }
+
+    private fun awaitVelocityCount(transport: CapturingMotionTransport, expected: Int): Boolean {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2)
+        while (System.nanoTime() < deadline) {
+            if (transport.velocityCount() >= expected) return true
+            Thread.sleep(10L)
+        }
+        return false
+    }
+
+    private class CapturingMotionTransport(
+        val listener: TeleopTransportListener,
+    ) : TeleopTransport {
+        val frames = CopyOnWriteArrayList<Triple<Long, String, JSONObject>>()
+        private val sequence = AtomicLong(0L)
+
+        override fun connect(config: ConnectionConfig) = Unit
+
+        override fun send(type: String, body: JSONObject): Long {
+            val sentSequence = sequence.getAndIncrement()
+            frames += Triple(sentSequence, type, JSONObject(body.toString()))
+            return sentSequence
+        }
+
+        fun velocityCount(): Int = frames.count { it.second == "motion.cartesian_velocity" }
+
+        override fun closeGracefully(reason: String) = Unit
+        override fun cancelNow() = Unit
+        override fun shutdown() = Unit
     }
 
     private class BlockingTransport(

@@ -8,14 +8,16 @@
 - 单一控制租约、1500 ms 客户端长按声明和四项现场检查；租约配置/请求范围为 500–2000 ms，服务端上限始终为 2000 ms；
 - 只有乐白官方状态码 `5 (IDLE)` 可取得租约，`7 (MOVING)` 和其他状态一律拒绝；
 - 严格单槽 20 Hz token-bucket 限速，不允许客户端靠积攒令牌突发双发；另有 300 ms 独立 watchdog；
+- 真机快照优先用一次 `get_kin_data()` 合并读取关节位置、速度和 TCP；连续运动可复用从采样开始计龄不超过 `200 ms` 且不超过 watchdog 的最新快照。快照选择、机器人/包络校验、消息时效复核、租约/安全 epoch 复核与 `speedl` 位于同一次后端锁内，状态轮询不能插入其间；首条 `speedl` 尚未返回时也受独立在途 watchdog 约束，超时通过不等待普通后端锁的 stop 通道撤租停止。
 - `pose.sample` 已实现手机 Rotation Vector 的 TCP 旋转 3DoF 增量控制：只执行 `Rx/Ry/Rz`，强制 `X/Y/Z=0`；每个 `calibration_id` 首帧必须为零增量并只做 priming，非零 priming 失败关闭，切换标定时先停止旧运动；priming 帧同样占用 20 Hz motion token，不能靠反复换标定绕过限流；
-- 姿态消息只接受精确 v1 schema、`phone_calibrated/tcp_orientation`、`tracking`、`confidence>=0.8`；同一标定内的传感器间隔限 `20-150 ms`，单帧旋转增量范数限 `0.25 rad`，派生输入角速度范数限 `6.0 rad/s`，之后仍按安全配置把实际角速度钳制到默认 `0.15 rad/s`；
+- 姿态消息只接受精确 v1 schema、`phone_calibrated/tcp_orientation`、`tracking`、`confidence>=0.8`；同一标定内的传感器间隔限 `20 ms` 到 `min(300 ms, watchdog_ms)`，单帧旋转增量范数限 `0.25 rad`，派生输入角速度范数限 `6.0 rad/s`，之后仍按安全配置把实际角速度钳制到默认 `0.15 rad/s`；
 - 连续有效的非零笛卡尔命令期间，若关节与 TCP 反馈在配置窗口内持续无可观测变化，则撤租、停止并报告 `FEEDBACK_STALLED`；
 - 会话建立后的过期/未来消息，以及所有乱序消息、非有限数值、错误 deadman、无租约和错误坐标系失败关闭；
 - 速度向量范数钳制、有限持续时间、六轴限位余量和 TCP 当前/预测工作空间检查；
 - 真机必须配置 TCP `Rx/Ry/Rz` 姿态中心和逐轴容差；授予租约、所有笛卡尔速度和每个 `pose.sample` 都按角度环绕后的最短距离检查当前姿态，非 priming 运动还检查按有限命令时长预测的姿态，越界返回 `ORIENTATION_LIMIT` 并走既有撤租/停止路径；
 - 任何已完成 `session.hello` 的 `motion.stop` 都优先执行，即使其 seq 或 body 随后被判无效；非控制者发起停止时还会撤销当前控制租约，防止原控制端沿用旧租约恢复；
 - 断连、租约过期、机器人状态异常或后端异常会先撤销控制权，再通过独立停止通道请求 `stop_move()`；
+- Bridge 记录 session 打开/关闭、控制权申请 grant/deny、安全停止和协议错误的精简诊断日志，不记录完整控制帧或完整 lease；安全撤租后客户端补发旧 `control.release` 时幂等确认，避免用二级 `LEASE_REQUIRED` 掩盖首个安全原因，但其他会话的有效租约仍不可被释放；
 - 不调用 `start_sys()`、`stop_sys()`、解除急停、关机或底盘控制接口；
 - `gripper.set` 只在当前 TCP XYZ/姿态位于配置包络内才会下发；它的 deadman 只授权一次目标，当前没有经真机验证的夹爪中途停止路径，`stop_move` 不能据此视为会停止 LMG-90；
 - 原始 episode、相机时间、异常标志和覆盖 episode 全部文件的 `manifest.sha256`；
@@ -114,4 +116,4 @@ python -m pytest .\teleop\bridge\tests
 
 手机的 `sensor_timestamp_ms` 是设备启动时钟。桥接器能验证同一标定内严格递增和相邻间隔，但无法把它与服务端墙钟直接比较来独立证明样本的绝对年龄；手机端还必须用同源单调时钟检查传感器新鲜度。首个 `session.hello` 为了完成时钟偏差下的会话建立而豁免绝对时效校验，welcome 后服务端仍用信封 `sent_at_ms` 严格检查每条网络消息。
 
-当前交付尚未完成 LM3-UP 真机停机距离/时延测试、Python 3.11 环境测试，以及官方 LeRobot v0.4.2 + FFmpeg 在 Windows 上的完整导出/回读端到端验证；这些项目通过前不得宣称真机或训练数据流水线已经验收。
+2026-08-09 已完成 LM3-UP 真机的只读状态、Android 局域网握手、当前静止 TCP 小包络加载、控制租约授予和超过 60 秒续租验证。随后现场曾按下运动 DEADMAN；旧客户端发送速率高于真机后端吞吐，积压帧触发 `STALE_MESSAGE` 并安全撤租，因此没有完成实体运动方向验收。事后多次复核六轴速度均为 0、TCP 无变化，也没有发送夹爪动作。部署单槽 ACK credit 客户端和有界快照 Bridge 后，又在当前静止 TCP 小包络内完成超过 2 分钟的 Android 真机静止持租验证，期间没有 `STALE_MESSAGE`、`LEASE_REQUIRED`、watchdog、撤租或断线。当前交付仍未完成实体运动方向、真机停机距离/时延、夹爪、Python 3.11 环境，以及官方 LeRobot v0.4.2 + FFmpeg 在 Windows 上的完整导出/回读端到端验证；这些项目通过前不得宣称真机运动或训练数据流水线已经验收。

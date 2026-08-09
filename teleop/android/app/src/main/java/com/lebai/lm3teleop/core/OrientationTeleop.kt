@@ -290,7 +290,7 @@ sealed interface PoseDeltaResult {
     data class Fault(val code: OrientationFault) : PoseDeltaResult
 }
 
-/** Computes the shortest left-difference in the calibrated phone frame between sent samples. */
+/** Computes the shortest left-difference in the calibrated phone frame between acknowledged samples. */
 class PoseDeltaTracker(
     private val maxSentDeltaRad: Double = Math.toRadians(12.0),
 ) {

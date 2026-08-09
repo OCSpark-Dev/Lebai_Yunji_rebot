@@ -147,7 +147,7 @@
 
 ## 5. 机械臂运动
 
-客户端仅在操作者持续按住 deadman 时，以最多 20 Hz 发送 `motion.cartesian_velocity`。服务端使用容量为 1 的 token bucket，两个命令不能在同一时刻突发通过；每接受一条后必须等待令牌按配置速率重新生成：
+客户端仅在操作者持续按住 deadman 时，以最多 20 Hz 发送 `motion.cartesian_velocity`。Android 客户端对 `motion.cartesian_velocity` 与 `pose.sample` 共用一个 ACK credit：同一时刻最多只有一条尚未收到精确 `ack_seq`/`ack_type` 回执的连续运动帧；等待期间只保留最新输入，不继续向 WebSocket 排队。`motion.stop` 不受该 credit 限制，松手时立即发送。服务端仍使用容量为 1 的 token bucket，两个命令不能在同一时刻突发通过；每接受一条后必须等待令牌按配置速率重新生成：
 
 ```json
 {
@@ -301,13 +301,15 @@
 2. 对相邻**成功写入 WebSocket** 的相对姿态计算 `q_delta = q_rel_current * inverse(q_rel_previous)`。
 3. 将四元数规范到 `w >= 0`，再转换为最短旋转矢量。
 4. 中性安装约定为手机屏幕朝上、手机顶部指向机器人基座 `+X`；手机旋转 `[x,y,z]` 映射为 TCP `[rx,ry,rz]=[y,-x,z]`。现场仍必须低速核对控制器轴向和手机安装方向。
-5. 每次按下姿态 DEADMAN 或生成新的 `calibration_id` 后，首帧必须发送零增量，只用于 priming；只有发送成功后，客户端才能提交该帧为下一次差分基线。随后若收到拒绝、超时或断连，必须失败关闭并丢弃该基线。
+5. 每次按下姿态 DEADMAN 或生成新的 `calibration_id` 后，首帧必须发送零增量，只用于 priming。客户端只有在收到精确匹配且 `accepted=true` 的 ACK 后，才能把该帧提交为下一次网络确认差分基线；等待 ACK 时到达的传感器样本只更新“最新姿态”，下一次发送从最后网络确认基线累计到该最新姿态。随后若收到拒绝、ACK 超时、断连或命中在途序号的 `error`，必须失败关闭并丢弃该基线。
+
+`ack.clamped=true` 只说明服务端对速度或持续时间做过限幅；v1 ACK 没有返回精确执行角位移，因此“网络确认差分基线”不能被描述为机械臂已经完整到达该手机姿态，也不能据此重建未执行的残余旋转。训练数据仍须以真实关节/TCP 反馈为准。
 
 桥接器固定执行以下服务端检查：
 
 - `deadman=true`，持有有效控制租约，`frame="phone_calibrated"`，`mapping="tcp_orientation"`。
 - `calibration_id` 非空、首尾无空白且最长 128 个字符；`tracking_state="tracking"`；`confidence` 在 `[0.8,1.0]`。
-- `sensor_timestamp_ms` 是手机启动时钟的正整数。在同一 `calibration_id` 内必须严格递增，相邻已接受样本间隔必须在 `20-150 ms`。
+- `sensor_timestamp_ms` 是手机启动时钟的正整数。在同一 `calibration_id` 内必须严格递增，相邻已接受样本间隔必须在 `20 ms` 到 `min(300 ms, watchdog_ms)` 之间；这允许单在途 ACK 背压吸收真机 RPC 延迟，同时保证上限不宽于运动看门狗。
 - `angular_delta_rad` 必须精确包含 `rx/ry/rz` 三个有限数值，单帧范数不得超过 `0.25 rad`；由 `delta / interval` 得到的输入角速度范数不得超过 `6.0 rad/s`。
 - 所有 `pose.sample`，包括 priming 帧，都占用同一个容量为 1 的 20 Hz motion token bucket；不断切换 `calibration_id` 不能绕过限流。
 - 首帧或新 `calibration_id` 必须携带零旋转增量，只建立基线，不调用 `speedl`；但桥接器仍会重新读取真机快照并检查当前 XYZ/姿态包络，越界同样失败关闭。非零 priming 会失败关闭。若切换标定时已有运动，桥接器先执行软件停止，保留原租约，再重新检查包络并建立新基线。

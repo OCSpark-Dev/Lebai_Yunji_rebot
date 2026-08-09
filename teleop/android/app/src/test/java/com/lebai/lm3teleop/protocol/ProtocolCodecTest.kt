@@ -31,9 +31,13 @@ class ProtocolCodecTest {
     }
 
     @Test
-    fun welcomeAlignsSubsequentHeartbeatAndMotionTimestampsToServerClock() {
-        var localTimeMs = 1_900L
-        val codec = ProtocolCodec { localTimeMs }
+    fun welcomeUsesMonotonicServerBaselineDespiteWallClockJumps() {
+        var wallTimeMs = 1_900L
+        var monotonicTimeMs = 10_000L
+        val codec = ProtocolCodec(
+            clock = { wallTimeMs },
+            monotonicClock = { monotonicTimeMs },
+        )
 
         val hello = codec.encode(
             "session.hello",
@@ -41,7 +45,8 @@ class ProtocolCodecTest {
         )
         assertEquals(1_900L, JSONObject(hello.json).getLong("sent_at_ms"))
 
-        localTimeMs = 2_000L
+        wallTimeMs = 2_000L
+        monotonicTimeMs = 10_100L
         codec.parse(
             envelope(
                 seq = 0,
@@ -50,19 +55,32 @@ class ProtocolCodecTest {
             ),
         )
 
-        localTimeMs = 2_025L
+        wallTimeMs = 100L
+        monotonicTimeMs = 10_125L
         val heartbeat = codec.encode("heartbeat", ProtocolBodies.heartbeat(null))
         assertEquals(50_025L, JSONObject(heartbeat.json).getLong("sent_at_ms"))
 
-        localTimeMs = 2_050L
+        wallTimeMs = Long.MAX_VALUE
+        monotonicTimeMs = 10_150L
         val motion = codec.encode("motion.stop", ProtocolBodies.motionStop(null, "test"))
         assertEquals(50_050L, JSONObject(motion.json).getLong("sent_at_ms"))
+
+        wallTimeMs = 77L
+        val repeatedHello = codec.encode(
+            "session.hello",
+            ProtocolBodies.sessionHello("client", "phone", "1.0"),
+        )
+        assertEquals(77L, JSONObject(repeatedHello.json).getLong("sent_at_ms"))
     }
 
     @Test
-    fun resetClearsServerClockOffsetForNextHello() {
-        var localTimeMs = 2_000L
-        val codec = ProtocolCodec { localTimeMs }
+    fun resetClearsServerClockBaselineForNextHello() {
+        var wallTimeMs = 2_000L
+        var monotonicTimeMs = 100L
+        val codec = ProtocolCodec(
+            clock = { wallTimeMs },
+            monotonicClock = { monotonicTimeMs },
+        )
         codec.parse(
             envelope(
                 seq = 0,
@@ -71,7 +89,8 @@ class ProtocolCodecTest {
             ),
         )
 
-        localTimeMs = 2_100L
+        wallTimeMs = 2_100L
+        monotonicTimeMs = 200L
         assertEquals(
             50_100L,
             JSONObject(codec.encode("heartbeat", ProtocolBodies.heartbeat(null)).json)
@@ -79,13 +98,71 @@ class ProtocolCodecTest {
         )
 
         codec.reset()
-        localTimeMs = 3_000L
+        wallTimeMs = 3_000L
+        monotonicTimeMs = 300L
         val hello = codec.encode(
             "session.hello",
             ProtocolBodies.sessionHello("client", "phone", "1.0"),
         )
         assertEquals(0L, hello.seq)
         assertEquals(3_000L, JSONObject(hello.json).getLong("sent_at_ms"))
+    }
+
+    @Test
+    fun monotonicRollbackCannotMoveServerTimestampBackwards() {
+        var monotonicTimeMs = 1_000L
+        val codec = ProtocolCodec(
+            clock = { 123L },
+            monotonicClock = { monotonicTimeMs },
+        )
+        codec.parse(
+            envelope(
+                seq = 0,
+                type = "session.welcome",
+                body = validWelcomeBody().put("server_time_ms", 50_000L),
+            ),
+        )
+
+        monotonicTimeMs = 1_100L
+        assertEquals(
+            50_100L,
+            JSONObject(codec.encode("heartbeat", ProtocolBodies.heartbeat(null)).json)
+                .getLong("sent_at_ms"),
+        )
+
+        monotonicTimeMs = 1_050L
+        assertEquals(
+            50_100L,
+            JSONObject(codec.encode("heartbeat", ProtocolBodies.heartbeat(null)).json)
+                .getLong("sent_at_ms"),
+        )
+
+        monotonicTimeMs = 1_150L
+        assertEquals(
+            50_150L,
+            JSONObject(codec.encode("heartbeat", ProtocolBodies.heartbeat(null)).json)
+                .getLong("sent_at_ms"),
+        )
+    }
+
+    @Test
+    fun serverTimestampArithmeticSaturatesInsteadOfOverflowing() {
+        var monotonicTimeMs = Long.MIN_VALUE
+        val codec = ProtocolCodec(
+            clock = { 123L },
+            monotonicClock = { monotonicTimeMs },
+        )
+        codec.parse(
+            envelope(
+                seq = 0,
+                type = "session.welcome",
+                body = validWelcomeBody().put("server_time_ms", Long.MAX_VALUE - 5L),
+            ),
+        )
+
+        monotonicTimeMs = Long.MAX_VALUE
+        val heartbeat = codec.encode("heartbeat", ProtocolBodies.heartbeat(null))
+        assertEquals(Long.MAX_VALUE, JSONObject(heartbeat.json).getLong("sent_at_ms"))
     }
 
     @Test

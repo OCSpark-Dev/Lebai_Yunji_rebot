@@ -147,6 +147,38 @@ class _BlockingSnapshotBackend(_MutableFeedbackBackend):
         return super().snapshot()
 
 
+class _OrderedSnapshotBackend(_MutableFeedbackBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.snapshot_started = threading.Event()
+        self.release_first_snapshot = threading.Event()
+        self.snapshot_calls = 0
+        self.operation_order: list[str] = []
+
+    def snapshot(self) -> RobotSnapshot:
+        self.snapshot_calls += 1
+        self.operation_order.append(f"snapshot-{self.snapshot_calls}")
+        if self.snapshot_calls == 1:
+            self.snapshot_started.set()
+            if not self.release_first_snapshot.wait(timeout=2.0):
+                raise TimeoutError("test did not release first snapshot")
+        return super().snapshot()
+
+    def speed_cartesian(self, linear_mps, angular_rps, duration_ms: int) -> int:
+        self.operation_order.append("speed")
+        return super().speed_cartesian(linear_mps, angular_rps, duration_ms)
+
+
+class _CountingSnapshotBackend(_MutableFeedbackBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.snapshot_calls = 0
+
+    def snapshot(self) -> RobotSnapshot:
+        self.snapshot_calls += 1
+        return super().snapshot()
+
+
 class _FailingStopBackend(_FrozenFeedbackBackend):
     def stop(self) -> None:
         self.stop_count += 1
@@ -1182,6 +1214,225 @@ async def _safety_epoch_stops_inflight_command_from_becoming_active(tmp_path: Pa
     assert server._motion_active is False
 
 
+def test_motion_snapshot_validation_and_speed_are_atomic_against_state_reads(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = AppConfig(
+            robot=RobotConfig(base_locked=True),
+            recording=RecordingConfig(root=tmp_path / "raw", fps=20),
+        )
+        backend = _OrderedSnapshotBackend()
+        server = TeleopServer(config, TOKEN, backend=backend)
+        session, websocket, lease_id = _owned_session(server)
+
+        motion_task = asyncio.create_task(
+            server._handle_text(
+                session,
+                _message(
+                    "motion.cartesian_velocity",
+                    1,
+                    {
+                        "lease_id": lease_id,
+                        "deadman": True,
+                        "frame": "base",
+                        "linear_mps": {"x": 0.01, "y": 0.0, "z": 0.0},
+                        "angular_rps": {"rx": 0.0, "ry": 0.0, "rz": 0.0},
+                        "duration_ms": 100,
+                    },
+                ),
+            )
+        )
+        assert await asyncio.to_thread(backend.snapshot_started.wait, 1.0)
+        state_read_task = asyncio.create_task(server._read_snapshot())
+        await asyncio.sleep(0)
+        backend.release_first_snapshot.set()
+
+        await motion_task
+        await state_read_task
+
+        assert backend.operation_order[:3] == ["snapshot-1", "speed", "snapshot-2"]
+        assert backend.speed_calls == 1
+        assert any(
+            message["type"] == "ack"
+            and message["body"]["ack_type"] == "motion.cartesian_velocity"
+            for message in _decoded_messages(websocket)
+        )
+
+    asyncio.run(scenario())
+
+
+def test_motion_reuses_fresh_snapshot_without_second_controller_read(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        config = AppConfig(
+            robot=RobotConfig(base_locked=True),
+            recording=RecordingConfig(root=tmp_path / "raw", fps=20),
+        )
+        backend = _CountingSnapshotBackend()
+        server = TeleopServer(config, TOKEN, backend=backend)
+        session, _, lease_id = _owned_session(server)
+
+        await server._read_snapshot()
+        await server._handle_text(
+            session,
+            _message(
+                "motion.cartesian_velocity",
+                1,
+                {
+                    "lease_id": lease_id,
+                    "deadman": True,
+                    "frame": "base",
+                    "linear_mps": {"x": 0.01, "y": 0.0, "z": 0.0},
+                    "angular_rps": {"rx": 0.0, "ry": 0.0, "rz": 0.0},
+                    "duration_ms": 100,
+                },
+            ),
+        )
+
+        assert backend.snapshot_calls == 1
+        assert backend.speed_calls == 1
+
+    asyncio.run(scenario())
+
+
+def test_motion_refreshes_expired_snapshot_before_speed(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        config = AppConfig(
+            robot=RobotConfig(base_locked=True),
+            recording=RecordingConfig(root=tmp_path / "raw", fps=20),
+        )
+        backend = _CountingSnapshotBackend()
+        server = TeleopServer(config, TOKEN, backend=backend)
+        session, _, lease_id = _owned_session(server)
+
+        await server._read_snapshot()
+        server._latest_snapshot_started_monotonic = time.monotonic() - 1.0
+        await server._handle_text(
+            session,
+            _message(
+                "motion.cartesian_velocity",
+                1,
+                {
+                    "lease_id": lease_id,
+                    "deadman": True,
+                    "frame": "base",
+                    "linear_mps": {"x": 0.01, "y": 0.0, "z": 0.0},
+                    "angular_rps": {"rx": 0.0, "ry": 0.0, "rz": 0.0},
+                    "duration_ms": 100,
+                },
+            ),
+        )
+
+        assert backend.snapshot_calls == 2
+        assert backend.speed_calls == 1
+
+    asyncio.run(scenario())
+
+
+def test_motion_that_becomes_stale_waiting_for_backend_lock_never_executes(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = AppConfig(
+            server=ServerConfig(max_message_age_ms=50),
+            robot=RobotConfig(base_locked=True),
+            recording=RecordingConfig(root=tmp_path / "raw", fps=20),
+        )
+        backend = _BlockingSnapshotBackend()
+        server = TeleopServer(config, TOKEN, backend=backend)
+        session, websocket, lease_id = _owned_session(server)
+
+        state_read_task = asyncio.create_task(server._read_snapshot())
+        assert await asyncio.to_thread(backend.snapshot_started.wait, 1.0)
+        motion_task = asyncio.create_task(
+            server._handle_text(
+                session,
+                _message(
+                    "motion.cartesian_velocity",
+                    1,
+                    {
+                        "lease_id": lease_id,
+                        "deadman": True,
+                        "frame": "base",
+                        "linear_mps": {"x": 0.01, "y": 0.0, "z": 0.0},
+                        "angular_rps": {"rx": 0.0, "ry": 0.0, "rz": 0.0},
+                        "duration_ms": 100,
+                    },
+                ),
+            )
+        )
+        await asyncio.sleep(0.08)
+        backend.release_snapshot.set()
+        await state_read_task
+        await motion_task
+
+        assert backend.speed_calls == 0
+        error = next(
+            message
+            for message in _decoded_messages(websocket)
+            if message["type"] == "error"
+        )
+        assert error["body"]["code"] == "STALE_MESSAGE"
+        assert server.leases.current is None
+
+    asyncio.run(scenario())
+
+
+def test_watchdog_stops_first_motion_while_speed_backend_is_still_inflight(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = AppConfig(
+            robot=RobotConfig(base_locked=True, emergency_stop_timeout_ms=80),
+            safety=SafetyConfig(watchdog_ms=100, feedback_stall_ms=100),
+            recording=RecordingConfig(root=tmp_path / "raw", fps=20),
+        )
+        backend = _DelayedSpeedBackend()
+        server = TeleopServer(config, TOKEN, backend=backend)
+        session, websocket, lease_id = _owned_session(server)
+
+        motion_task = asyncio.create_task(
+            server._handle_text(
+                session,
+                _message(
+                    "motion.cartesian_velocity",
+                    1,
+                    {
+                        "lease_id": lease_id,
+                        "deadman": True,
+                        "frame": "base",
+                        "linear_mps": {"x": 0.01, "y": 0.0, "z": 0.0},
+                        "angular_rps": {"rx": 0.0, "ry": 0.0, "rz": 0.0},
+                        "duration_ms": 100,
+                    },
+                ),
+            )
+        )
+        assert await asyncio.to_thread(backend.speed_started.wait, 1.0)
+        watchdog_task = asyncio.create_task(server._watchdog_loop())
+        try:
+            deadline = asyncio.get_running_loop().time() + 1.0
+            while server.leases.current is not None and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.02)
+            assert server.leases.current is None
+            assert backend.stop_count >= 1
+        finally:
+            backend.release_speed.set()
+            await motion_task
+            watchdog_task.cancel()
+            await asyncio.gather(watchdog_task, return_exceptions=True)
+
+        assert server._motion_active is False
+        assert not any(
+            message["type"] == "ack"
+            and message["body"].get("ack_type") == "motion.cartesian_velocity"
+            and message["body"].get("accepted") is True
+            for message in _decoded_messages(websocket)
+        )
+
+    asyncio.run(scenario())
+
+
 def test_session_established_non_owner_stop_revokes_existing_lease(tmp_path: Path) -> None:
     asyncio.run(_session_established_non_owner_stop_revokes_existing_lease(tmp_path))
 
@@ -1222,6 +1473,78 @@ async def _session_established_non_owner_stop_revokes_existing_lease(tmp_path: P
         and value["body"]["reason"] == "external_stop"
         for value in owner_messages
     )
+
+
+def test_release_after_safety_revoke_is_idempotent(tmp_path: Path) -> None:
+    asyncio.run(_release_after_safety_revoke_is_idempotent(tmp_path))
+
+
+async def _release_after_safety_revoke_is_idempotent(tmp_path: Path) -> None:
+    config = AppConfig(
+        robot=RobotConfig(base_locked=True),
+        recording=RecordingConfig(root=tmp_path / "raw", fps=20),
+    )
+    backend = SimulatorBackend(config.robot)
+    server = TeleopServer(config, TOKEN, backend=backend)
+    session, websocket, lease_id = _owned_session(server)
+
+    await server._safe_stop(
+        "WORKSPACE_LIMIT",
+        "test safety revocation",
+        revoke=True,
+        stop_recording=True,
+    )
+    stop_count_after_revoke = backend.stop_count
+    websocket.sent.clear()
+
+    await server._handle_text(
+        session,
+        _message("control.release", 1, {"lease_id": lease_id}),
+    )
+
+    messages = _decoded_messages(websocket)
+    assert server.leases.current is None
+    assert backend.stop_count == stop_count_after_revoke
+    assert not any(message["type"] == "error" for message in messages)
+    ack = next(message for message in messages if message["type"] == "ack")
+    assert ack["body"]["ack_seq"] == 1
+    assert ack["body"]["ack_type"] == "control.release"
+    assert ack["body"]["accepted"] is True
+    assert ack["body"]["detail"] == "control lease already released"
+
+
+def test_release_does_not_clear_another_sessions_valid_lease(tmp_path: Path) -> None:
+    asyncio.run(_release_does_not_clear_another_sessions_valid_lease(tmp_path))
+
+
+async def _release_does_not_clear_another_sessions_valid_lease(tmp_path: Path) -> None:
+    config = AppConfig(
+        robot=RobotConfig(base_locked=True),
+        recording=RecordingConfig(root=tmp_path / "raw", fps=20),
+    )
+    backend = SimulatorBackend(config.robot)
+    server = TeleopServer(config, TOKEN, backend=backend)
+    owner, _, lease_id = _owned_session(server, client_id="owner")
+    outsider_socket = _MemoryWebSocket()
+    outsider = ClientSession(websocket=outsider_socket)  # type: ignore[arg-type]
+    outsider.hello_complete = True
+    outsider.client_id = "outsider"
+    outsider.last_inbound_seq = 0
+    server.sessions[outsider.session_id] = outsider
+
+    await server._handle_text(
+        outsider,
+        _message("control.release", 1, {"lease_id": lease_id}),
+    )
+
+    messages = _decoded_messages(outsider_socket)
+    assert server.leases.current is not None
+    assert server.leases.current.session_id == owner.session_id
+    assert server.leases.current.lease_id == lease_id
+    assert backend.stop_count == 0
+    error = next(message for message in messages if message["type"] == "error")
+    assert error["body"]["code"] == "LEASE_REQUIRED"
+    assert error["body"]["ack_seq"] == 1
 
 
 def test_external_stop_failure_is_not_acknowledged_as_success(tmp_path: Path) -> None:
@@ -2128,7 +2451,7 @@ def test_pose_sample_non_finite_numbers_fail_closed(
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("sensor_timestamp_ms", [1_000, 999, 1_019, 1_151])
+@pytest.mark.parametrize("sensor_timestamp_ms", [1_000, 999, 1_019, 1_301])
 def test_pose_sample_timestamp_or_interval_errors_fail_closed(
     tmp_path: Path, sensor_timestamp_ms: int
 ) -> None:
@@ -2166,6 +2489,77 @@ def test_pose_sample_timestamp_or_interval_errors_fail_closed(
         assert server.leases.current is None
         assert server._pose_states == {}
         assert backend.stop_count >= 1
+
+    asyncio.run(scenario())
+
+
+def test_pose_sample_accepts_interval_up_to_three_hundred_ms_watchdog(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        config = AppConfig(
+            robot=RobotConfig(base_locked=True),
+            recording=RecordingConfig(root=tmp_path / "raw", fps=20),
+        )
+        backend = SimulatorBackend(config.robot)
+        server = TeleopServer(config, TOKEN, backend=backend)
+        session, websocket, lease_id = _owned_session(server)
+        await _prime_pose(server, session, lease_id)
+        websocket.sent.clear()
+        await asyncio.sleep(MOTION_COMMAND_TEST_SPACING_S)
+
+        await server._handle_text(
+            session,
+            _message(
+                "pose.sample",
+                2,
+                _pose_body(
+                    lease_id,
+                    sensor_timestamp_ms=1_300,
+                    angular_delta_rad=(0.003, 0.0, 0.0),
+                ),
+            ),
+        )
+
+        ack = next(
+            message
+            for message in _decoded_messages(websocket)
+            if message["type"] == "ack"
+        )
+        assert ack["body"]["accepted"] is True
+        assert server._last_command["sensor_interval_ms"] == 300
+
+    asyncio.run(scenario())
+
+
+def test_pose_sample_interval_is_capped_by_shorter_watchdog(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        config = AppConfig(
+            robot=RobotConfig(base_locked=True),
+            safety=SafetyConfig(watchdog_ms=200, feedback_stall_ms=150),
+            recording=RecordingConfig(root=tmp_path / "raw", fps=20),
+        )
+        backend = SimulatorBackend(config.robot)
+        server = TeleopServer(config, TOKEN, backend=backend)
+        session, websocket, lease_id = _owned_session(server)
+        await _prime_pose(server, session, lease_id)
+        websocket.sent.clear()
+
+        await server._handle_text(
+            session,
+            _message(
+                "pose.sample",
+                2,
+                _pose_body(lease_id, sensor_timestamp_ms=1_201),
+            ),
+        )
+
+        error = next(
+            message
+            for message in _decoded_messages(websocket)
+            if message["type"] == "error"
+        )
+        assert error["body"]["code"] == "INVALID_MESSAGE"
+        assert "between 20 and 200 ms" in error["body"]["message"]
+        assert server.leases.current is None
 
     asyncio.run(scenario())
 
@@ -2237,6 +2631,8 @@ def test_pose_sample_execution_errors_stop_revoke_and_clear_state(
         session, websocket, lease_id = _owned_session(server)
         await _prime_pose(server, session, lease_id)
         await asyncio.sleep(MOTION_COMMAND_TEST_SPACING_S)
+        if failure == "snapshot":
+            server._latest_snapshot_started_monotonic = time.monotonic() - 1.0
         websocket.sent.clear()
 
         await server._handle_text(

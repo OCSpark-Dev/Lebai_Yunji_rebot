@@ -34,7 +34,7 @@ class TeleopControllerPoseTest {
             monotonicClock = monotonicNowMs::get,
             scheduler = scheduler,
             transportFactory = { listener ->
-                CapturingTransport(listener, poseTarget = 2).also { transport = it }
+                CapturingTransport(listener, poseTarget = 3).also { transport = it }
             },
         )
 
@@ -43,6 +43,18 @@ class TeleopControllerPoseTest {
             val initial = calibrated(UnitQuaternion.IDENTITY, 1_000_000_000L)
             assertTrue(controller.startPoseMotion("calibration-1", initial))
             assertTrue(transport.firstPose.await(1, TimeUnit.SECONDS))
+            val primingSequence = transport.sequencedFrames.first { it.second == "pose.sample" }.first
+            controller.onServerMessage(
+                ServerMessage.Ack(
+                    seq = 3L,
+                    sentAtMs = 5_003L,
+                    ackSeq = primingSequence,
+                    ackType = "pose.sample",
+                    accepted = true,
+                    clamped = false,
+                    detail = "primed",
+                ),
+            )
 
             val phoneTopRotation = axisAngle(y = 1.0, degrees = 5.0)
             assertTrue(
@@ -51,9 +63,9 @@ class TeleopControllerPoseTest {
                     calibrated(phoneTopRotation, 1_020_000_000L),
                 ),
             )
-            assertTrue(transport.poseTargetReached.await(2, TimeUnit.SECONDS))
+            assertTrue(awaitPoseCount(transport, 2))
 
-            val poses = transport.frames.filter { it.first == "pose.sample" }.map { it.second }
+            var poses = transport.frames.filter { it.first == "pose.sample" }.map { it.second }
             assertTrue(poses.size >= 2)
             val priming = poses[0].getJSONObject("angular_delta_rad")
             assertEquals(0.0, priming.getDouble("rx"), 0.0)
@@ -66,6 +78,33 @@ class TeleopControllerPoseTest {
             assertEquals(0.0, delta.getDouble("ry"), 1e-9)
             assertEquals(0.0, delta.getDouble("rz"), 1e-9)
             assertEquals(1_020L, poses[1].getLong("sensor_timestamp_ms"))
+
+            val secondSequence = transport.sequencedFrames.filter { it.second == "pose.sample" }[1].first
+            assertTrue(
+                controller.updatePoseMotion(
+                    "calibration-1",
+                    calibrated(axisAngle(y = 1.0, degrees = 8.0), 1_170_000_000L),
+                ),
+            )
+            Thread.sleep(120L)
+            assertEquals(2, transport.frames.count { it.first == "pose.sample" })
+
+            controller.onServerMessage(
+                ServerMessage.Ack(
+                    seq = 4L,
+                    sentAtMs = 5_004L,
+                    ackSeq = secondSequence,
+                    ackType = "pose.sample",
+                    accepted = true,
+                    clamped = true,
+                    detail = "server limited execution",
+                ),
+            )
+            assertTrue(transport.poseTargetReached.await(2, TimeUnit.SECONDS))
+            poses = transport.frames.filter { it.first == "pose.sample" }.map { it.second }
+            val coalescedDelta = poses[2].getJSONObject("angular_delta_rad")
+            assertEquals(Math.toRadians(3.0), coalescedDelta.getDouble("rx"), 1e-9)
+            assertEquals(1_170L, poses[2].getLong("sensor_timestamp_ms"))
         } finally {
             controller.stopMotion("test_complete")
             scheduler.shutdownNow()
@@ -97,6 +136,18 @@ class TeleopControllerPoseTest {
                 ),
             )
             assertTrue(transport.firstPose.await(1, TimeUnit.SECONDS))
+            val primingSequence = transport.sequencedFrames.first { it.second == "pose.sample" }.first
+            controller.onServerMessage(
+                ServerMessage.Ack(
+                    seq = 3L,
+                    sentAtMs = 5_003L,
+                    ackSeq = primingSequence,
+                    ackType = "pose.sample",
+                    accepted = true,
+                    clamped = false,
+                    detail = "primed",
+                ),
+            )
 
             monotonicNowMs.set(1_151L)
             assertTrue(transport.stopSent.await(2, TimeUnit.SECONDS))
@@ -107,7 +158,7 @@ class TeleopControllerPoseTest {
     }
 
     @Test
-    fun delayedRecoverablePoseErrorAfterDeadmanReleaseStillRevokesLease() {
+    fun recoverablePoseErrorMatchingInflightCommandFailsClosed() {
         val scheduler = Executors.newSingleThreadScheduledExecutor()
         lateinit var transport: CapturingTransport
         val snapshots = CopyOnWriteArrayList<ControllerSnapshot>()
@@ -133,7 +184,6 @@ class TeleopControllerPoseTest {
             assertTrue(transport.firstPose.await(1, TimeUnit.SECONDS))
             val poseSequence = transport.sequencedFrames.first { it.second == "pose.sample" }.first
 
-            controller.stopMotion("orientation_deadman_released")
             controller.onServerMessage(
                 ServerMessage.Error(
                     seq = 3L,
@@ -153,23 +203,24 @@ class TeleopControllerPoseTest {
     }
 
     @Test
-    fun unacknowledgedPoseBacklogFailsClosedInsteadOfDroppingOldSequences() {
+    fun unacknowledgedPoseUsesOneCreditThenAckTimeoutFailsClosed() {
         val scheduler = Executors.newSingleThreadScheduledExecutor()
         lateinit var controller: TeleopController
         lateinit var transport: CapturingTransport
+        val monotonicNowMs = AtomicLong(1_000L)
         val poseTimestampNs = AtomicLong(1_000_000_000L)
         controller = TeleopController(
             clientId = "client-1",
             appVersion = "test",
             listener = {},
-            monotonicClock = { 1_000L },
+            monotonicClock = monotonicNowMs::get,
             scheduler = scheduler,
             transportFactory = { listener ->
                 CapturingTransport(
                     listener = listener,
-                    poseTarget = 33,
+                    poseTarget = 2,
                     onPoseSent = { poseCount ->
-                        if (poseCount < 33) {
+                        if (poseCount == 1) {
                             val nextTimestamp = poseTimestampNs.addAndGet(50_000_000L)
                             controller.updatePoseMotion(
                                 "calibration-1",
@@ -192,12 +243,15 @@ class TeleopControllerPoseTest {
                     calibrated(UnitQuaternion.IDENTITY, poseTimestampNs.get()),
                 ),
             )
+            assertTrue(transport.firstPose.await(1, TimeUnit.SECONDS))
+            Thread.sleep(120L)
+            assertEquals(1, transport.frames.count { it.first == "pose.sample" })
 
-            assertTrue(transport.poseTargetReached.await(3, TimeUnit.SECONDS))
+            monotonicNowMs.set(1_251L)
             assertTrue(transport.releaseSent.await(1, TimeUnit.SECONDS))
             assertTrue(
                 transport.frames.any {
-                    it.first == "motion.stop" && it.second.getString("reason") == "pose_ack_backlog"
+                    it.first == "motion.stop" && it.second.getString("reason") == "motion_ack_timeout"
                 },
             )
         } finally {
@@ -255,6 +309,15 @@ class TeleopControllerPoseTest {
                 reason = null,
             ),
         )
+    }
+
+    private fun awaitPoseCount(transport: CapturingTransport, expected: Int): Boolean {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2)
+        while (System.nanoTime() < deadline) {
+            if (transport.frames.count { it.first == "pose.sample" } >= expected) return true
+            Thread.sleep(10L)
+        }
+        return false
     }
 
     private fun calibrated(orientation: UnitQuaternion, timestampNs: Long): CalibratedOrientation =

@@ -48,11 +48,12 @@ LOGGER = logging.getLogger("lm3_teleop_bridge")
 FEEDBACK_CHANGE_EPSILON = 1e-6
 POSE_MIN_CONFIDENCE = 0.8
 POSE_MIN_INTERVAL_MS = 20
-POSE_MAX_INTERVAL_MS = 150
+POSE_MAX_INTERVAL_MS = 300
 POSE_MAX_SINGLE_FRAME_DELTA_RAD = 0.25
 POSE_MAX_INPUT_ANGULAR_RPS = 6.0
 POSE_PRIMING_EPSILON_RAD = 1e-9
 POSE_MAX_CALIBRATION_ID_LENGTH = 128
+MOTION_SNAPSHOT_MAX_AGE_MS = 200
 POSE_SAMPLE_BODY_KEYS = frozenset(
     {
         "lease_id",
@@ -157,6 +158,10 @@ class TeleopServer:
         self._last_feedback_change_monotonic = time.monotonic()
         self._feedback_signature: tuple[float, ...] | None = None
         self._latest_snapshot: RobotSnapshot | None = None
+        self._latest_snapshot_started_monotonic: float | None = None
+        self._motion_inflight_generation = 0
+        self._motion_inflight_token: int | None = None
+        self._motion_inflight_deadline_monotonic = 0.0
         self._recording_cameras: list[str] = []
         self._pose_states: dict[str, PoseSampleState] = {}
         self._last_command: dict[str, Any] = {
@@ -235,6 +240,8 @@ class TeleopServer:
             motion_bucket=TokenBucket(self.config.safety.command_rate_hz, 1.0),
         )
         self.sessions[session.session_id] = session
+        peer = _peer_log_label(websocket)
+        LOGGER.info("session.open session=%s peer=%s", _session_log_id(session), peer)
         try:
             async for message in websocket:
                 if not isinstance(message, str):
@@ -248,14 +255,25 @@ class TeleopServer:
         except ConnectionClosed:
             pass
         finally:
+            was_owner = self.leases.current is not None and self.leases.current.session_id == session.session_id
             self.sessions.pop(session.session_id, None)
             self._pose_states.pop(session.session_id, None)
-            if self.leases.current is not None and self.leases.current.session_id == session.session_id:
-                await self._safe_stop(
-                    "CLIENT_DISCONNECTED",
-                    "control owner disconnected",
-                    revoke=True,
-                    stop_recording=True,
+            try:
+                if was_owner:
+                    await self._safe_stop(
+                        "CLIENT_DISCONNECTED",
+                        "control owner disconnected",
+                        revoke=True,
+                        stop_recording=True,
+                    )
+            finally:
+                LOGGER.info(
+                    "session.close session=%s peer=%s hello_complete=%s was_owner=%s close_code=%s",
+                    _session_log_id(session),
+                    peer,
+                    session.hello_complete,
+                    was_owner,
+                    getattr(websocket, "close_code", None),
                 )
 
     async def _handle_text(self, session: ClientSession, text: str) -> None:
@@ -472,6 +490,34 @@ class TeleopServer:
         if message_type == "control.acquire":
             await self._control_acquire(session, envelope)
         elif message_type == "control.release":
+            lease_id = require_string(envelope.body, "lease_id")
+            if await self._stop_expired_lease():
+                LOGGER.info(
+                    "control.release session=%s result=already_released reason=lease_expired",
+                    _session_log_id(session),
+                )
+                await self._send_ack(
+                    session,
+                    envelope,
+                    accepted=True,
+                    detail="control lease already released",
+                )
+                return
+            current = self.leases.current
+            if current is None:
+                LOGGER.info(
+                    "control.release session=%s result=already_released reason=no_current_lease",
+                    _session_log_id(session),
+                )
+                await self._send_ack(
+                    session,
+                    envelope,
+                    accepted=True,
+                    detail="control lease already released",
+                )
+                return
+            if current.session_id != session.session_id or current.lease_id != lease_id:
+                raise ProtocolError("LEASE_REQUIRED", "a valid control lease is required")
             lease = self._require_lease(session, envelope.body)
             await self._safe_stop(
                 "CONTROL_RELEASED",
@@ -480,6 +526,7 @@ class TeleopServer:
                 stop_recording=True,
                 emit_event=False,
             )
+            LOGGER.info("control.release session=%s result=released", _session_log_id(session))
             await self._send_ack(session, envelope, accepted=True, detail=f"released {lease.lease_id}")
         elif message_type == "heartbeat":
             lease_id = envelope.body.get("lease_id")
@@ -524,6 +571,11 @@ class TeleopServer:
             raise ProtocolError("INVALID_MESSAGE", "safety_ack must be an object")
         required_checks = ("base_stationary", "workspace_clear", "estop_accessible", "tool_secure")
         if hold < 1_500 or not all(require_bool(safety_ack, item) for item in required_checks):
+            self._log_control_acquire(
+                session,
+                granted=False,
+                reason="safety_check_or_hold_incomplete",
+            )
             await session.send(
                 "control.status",
                 {
@@ -536,9 +588,11 @@ class TeleopServer:
             )
             return
         if await self._stop_expired_lease():
+            self._log_control_acquire(session, granted=False, reason="lease_expired")
             return
         acquire_epoch = self._safety_epoch
         if self._stop_lock.locked():
+            self._log_control_acquire(session, granted=False, reason="safety_stop_in_progress")
             await session.send(
                 "control.status",
                 {
@@ -552,6 +606,12 @@ class TeleopServer:
             return
         snapshot = await self._read_snapshot()
         if snapshot.robot_state_code != 5 or not self._snapshot_ready(snapshot):
+            self._log_control_acquire(
+                session,
+                granted=False,
+                reason="robot_must_be_idle_ready_and_base_locked",
+                detail=f"state_code={snapshot.robot_state_code}",
+            )
             await session.send(
                 "control.status",
                 {
@@ -563,12 +623,19 @@ class TeleopServer:
                 },
             )
             return
-        if self._motion_envelope_error(
+        envelope_error = self._motion_envelope_error(
             snapshot,
             linear=(0.0, 0.0, 0.0),
             angular=(0.0, 0.0, 0.0),
             duration_ms=0,
-        ) is not None:
+        )
+        if envelope_error is not None:
+            self._log_control_acquire(
+                session,
+                granted=False,
+                reason="robot_not_within_configured_motion_envelope",
+                detail=f"envelope_error={envelope_error}",
+            )
             await session.send(
                 "control.status",
                 {
@@ -592,6 +659,7 @@ class TeleopServer:
                     requested_ms=requested,
                 )
         if interrupted_by_stop:
+            self._log_control_acquire(session, granted=False, reason="safety_stop_in_progress")
             await session.send(
                 "control.status",
                 {
@@ -604,9 +672,20 @@ class TeleopServer:
             )
             return
         if lease is None and await self._stop_expired_lease():
+            self._log_control_acquire(session, granted=False, reason="lease_expired")
             return
         if lease is None:
             current = self.leases.current
+            self._log_control_acquire(
+                session,
+                granted=False,
+                reason="lease_busy",
+                detail=(
+                    f"owner_session={_session_log_id_value(current.session_id)}"
+                    if current is not None
+                    else "owner_session=-"
+                ),
+            )
             await session.send(
                 "control.status",
                 {
@@ -618,7 +697,30 @@ class TeleopServer:
                 },
             )
             return
+        self._log_control_acquire(
+            session,
+            granted=True,
+            reason="granted",
+            detail=f"lease_ms={lease.duration_ms}",
+        )
         await self._send_control_status(session, lease, granted=True, reason="granted")
+
+    @staticmethod
+    def _log_control_acquire(
+        session: ClientSession,
+        *,
+        granted: bool,
+        reason: str,
+        detail: str = "",
+    ) -> None:
+        LOGGER.log(
+            logging.INFO if granted else logging.WARNING,
+            "control.acquire session=%s granted=%s reason=%s detail=%s",
+            _session_log_id(session),
+            granted,
+            reason,
+            detail or "-",
+        )
 
     async def _motion_velocity(self, session: ClientSession, envelope: Envelope) -> None:
         body = envelope.body
@@ -768,10 +870,11 @@ class TeleopServer:
             raise ProtocolError(
                 "INVALID_MESSAGE", "sensor_timestamp_ms must increase strictly"
             )
-        if not POSE_MIN_INTERVAL_MS <= interval_ms <= POSE_MAX_INTERVAL_MS:
+        max_interval_ms = min(POSE_MAX_INTERVAL_MS, self.config.safety.watchdog_ms)
+        if not POSE_MIN_INTERVAL_MS <= interval_ms <= max_interval_ms:
             raise ProtocolError(
                 "INVALID_MESSAGE",
-                f"pose sensor interval must be between {POSE_MIN_INTERVAL_MS} and {POSE_MAX_INTERVAL_MS} ms",
+                f"pose sensor interval must be between {POSE_MIN_INTERVAL_MS} and {max_interval_ms} ms",
             )
         interval_s = interval_ms / 1_000
         input_angular = tuple(component / interval_s for component in angular_delta)
@@ -815,6 +918,9 @@ class TeleopServer:
         requested_duration: int,
         audit: dict[str, Any] | None = None,
     ) -> None:
+        command_deadline_monotonic = (
+            time.monotonic() + self.config.safety.watchdog_ms / 1_000
+        )
         command_epoch = self._safety_epoch
         if not session.motion_bucket.consume():
             raise ProtocolError("RATE_LIMITED", "motion command rate exceeds 20 Hz")
@@ -824,27 +930,61 @@ class TeleopServer:
         )
         linear, angular, velocity_clamped = clamp_twist(linear, angular, self.config.safety)
         clamped = velocity_clamped or duration != requested_duration
-        snapshot = await self._read_snapshot()
-        if not self._snapshot_ready(snapshot):
-            raise ProtocolError("ROBOT_NOT_READY", "robot state does not allow motion")
-        envelope_error = self._motion_envelope_error(
-            snapshot,
-            linear=linear,
-            angular=angular,
-            duration_ms=duration,
-        )
-        if envelope_error == "WORKSPACE_LIMIT":
-            raise ProtocolError("WORKSPACE_LIMIT", "current or predicted TCP is outside the workspace")
-        if envelope_error == "ORIENTATION_LIMIT":
-            raise ProtocolError(
-                "ORIENTATION_LIMIT",
-                "current or predicted TCP orientation is outside the configured envelope",
-            )
         async with self._backend_lock:
-            self._assert_command_current(session, lease.lease_id, command_epoch)
-            motion_id = await asyncio.to_thread(
-                self.backend.speed_cartesian, linear, angular, duration
+            snapshot = self._fresh_motion_snapshot_locked()
+            if snapshot is None:
+                snapshot_started_monotonic = time.monotonic()
+                snapshot = await asyncio.to_thread(self.backend.snapshot)
+                self._remember_snapshot(snapshot, snapshot_started_monotonic)
+            snapshot_started_monotonic = self._latest_snapshot_started_monotonic
+            max_snapshot_age_ms = min(
+                MOTION_SNAPSHOT_MAX_AGE_MS,
+                self.config.safety.watchdog_ms,
             )
+            if (
+                snapshot_started_monotonic is None
+                or (time.monotonic() - snapshot_started_monotonic) * 1_000
+                > max_snapshot_age_ms
+            ):
+                raise ProtocolError(
+                    "STALE_MESSAGE",
+                    "robot snapshot exceeded the motion freshness limit",
+                )
+            if time.monotonic() > command_deadline_monotonic:
+                raise ProtocolError(
+                    "STALE_MESSAGE",
+                    "motion command exceeded the watchdog before backend execution",
+                )
+            # A frame can be fresh when it enters the WebSocket queue and become stale
+            # while waiting for a slow controller snapshot. Recheck immediately before
+            # touching the actuator.
+            self._validate_message_time(envelope)
+            if not self._snapshot_ready(snapshot):
+                raise ProtocolError("ROBOT_NOT_READY", "robot state does not allow motion")
+            envelope_error = self._motion_envelope_error(
+                snapshot,
+                linear=linear,
+                angular=angular,
+                duration_ms=duration,
+            )
+            if envelope_error == "WORKSPACE_LIMIT":
+                raise ProtocolError(
+                    "WORKSPACE_LIMIT",
+                    "current or predicted TCP is outside the workspace",
+                )
+            if envelope_error == "ORIENTATION_LIMIT":
+                raise ProtocolError(
+                    "ORIENTATION_LIMIT",
+                    "current or predicted TCP orientation is outside the configured envelope",
+                )
+            self._assert_command_current(session, lease.lease_id, command_epoch)
+            inflight_token = self._begin_motion_inflight(command_deadline_monotonic)
+            try:
+                motion_id = await asyncio.to_thread(
+                    self.backend.speed_cartesian, linear, angular, duration
+                )
+            finally:
+                self._finish_motion_inflight(inflight_token)
         if not self._command_is_current(session, lease.lease_id, command_epoch):
             await self._execute_stop()
             raise ProtocolError(
@@ -1051,6 +1191,14 @@ class TeleopServer:
         await session.send("ack", body)
 
     async def _send_error(self, session: ClientSession, error: ProtocolError) -> None:
+        LOGGER.log(
+            logging.WARNING if error.recoverable else logging.ERROR,
+            "protocol.error session=%s code=%s recoverable=%s ack_seq=%s",
+            _session_log_id(session),
+            error.code,
+            error.recoverable,
+            error.ack_seq,
+        )
         body: dict[str, Any] = {
             "code": error.code,
             "message": error.message,
@@ -1076,10 +1224,45 @@ class TeleopServer:
 
     async def _read_snapshot(self) -> RobotSnapshot:
         async with self._backend_lock:
+            snapshot_started_monotonic = time.monotonic()
             snapshot = await asyncio.to_thread(self.backend.snapshot)
+            return self._remember_snapshot(snapshot, snapshot_started_monotonic)
+
+    def _remember_snapshot(
+        self,
+        snapshot: RobotSnapshot,
+        snapshot_started_monotonic: float,
+    ) -> RobotSnapshot:
         self._observe_feedback(snapshot)
         self._latest_snapshot = snapshot
+        # Use the sampling start, not completion, so cache age conservatively
+        # includes time spent collecting controller fields.
+        self._latest_snapshot_started_monotonic = snapshot_started_monotonic
         return snapshot
+
+    def _fresh_motion_snapshot_locked(self) -> RobotSnapshot | None:
+        snapshot = self._latest_snapshot
+        started = self._latest_snapshot_started_monotonic
+        if snapshot is None or started is None:
+            return None
+        age_ms = (time.monotonic() - started) * 1_000
+        max_age_ms = min(MOTION_SNAPSHOT_MAX_AGE_MS, self.config.safety.watchdog_ms)
+        if age_ms < 0 or age_ms > max_age_ms:
+            return None
+        return snapshot
+
+    def _begin_motion_inflight(self, deadline_monotonic: float) -> int:
+        self._motion_inflight_generation += 1
+        token = self._motion_inflight_generation
+        self._motion_inflight_token = token
+        self._motion_inflight_deadline_monotonic = deadline_monotonic
+        return token
+
+    def _finish_motion_inflight(self, token: int) -> None:
+        if self._motion_inflight_token != token:
+            return
+        self._motion_inflight_token = None
+        self._motion_inflight_deadline_monotonic = 0.0
 
     async def _execute_stop(self, *, invalidate: bool = True) -> None:
         if invalidate:
@@ -1106,8 +1289,17 @@ class TeleopServer:
         stop_recording: bool,
         emit_event: bool = True,
     ) -> bool:
+        motion_was_active = self._motion_active
         self._invalidate_commands()
         released = self.leases.release() if revoke else None
+        LOGGER.warning(
+            "safe_stop code=%s revoke_requested=%s lease_revoked=%s owner_session=%s motion_was_active=%s",
+            code,
+            revoke,
+            released is not None,
+            _session_log_id_value(released.session_id) if released is not None else "-",
+            motion_was_active,
+        )
         stop_error: Exception | None = None
         async with self._stop_lock:
             try:
@@ -1157,8 +1349,20 @@ class TeleopServer:
             await asyncio.sleep(interval)
             if await self._stop_expired_lease():
                 continue
+            now_monotonic = time.monotonic()
+            if (
+                self._motion_inflight_token is not None
+                and now_monotonic > self._motion_inflight_deadline_monotonic
+            ):
+                await self._safe_stop(
+                    "WATCHDOG_TIMEOUT",
+                    "motion backend call exceeded the watchdog deadline",
+                    revoke=True,
+                    stop_recording=True,
+                )
+                continue
             if self._motion_active:
-                age_ms = (time.monotonic() - self._last_valid_motion) * 1_000
+                age_ms = (now_monotonic - self._last_valid_motion) * 1_000
                 if age_ms > self.config.safety.watchdog_ms:
                     await self._safe_stop(
                         "WATCHDOG_TIMEOUT",
@@ -1307,6 +1511,9 @@ class TeleopServer:
         self._motion_active = False
         self._feedback_motion_expected = False
         self._motion_command_expires_monotonic = 0.0
+        self._motion_inflight_generation += 1
+        self._motion_inflight_token = None
+        self._motion_inflight_deadline_monotonic = 0.0
         self._pose_states.clear()
 
     def _observe_feedback(self, snapshot: RobotSnapshot) -> None:
@@ -1399,3 +1606,20 @@ def _raw_message_type(text: str) -> str | None:
     except Exception:
         return None
     return value.get("type") if isinstance(value, dict) and isinstance(value.get("type"), str) else None
+
+
+def _session_log_id(session: ClientSession) -> str:
+    return _session_log_id_value(session.session_id)
+
+
+def _session_log_id_value(session_id: str) -> str:
+    return session_id[:8] if session_id else "-"
+
+
+def _peer_log_label(websocket: ServerConnection) -> str:
+    peer = getattr(websocket, "remote_address", None)
+    if isinstance(peer, tuple) and peer:
+        host = str(peer[0])
+        port = peer[1] if len(peer) > 1 else None
+        return f"{host}:{port}" if port is not None else host
+    return "unknown"

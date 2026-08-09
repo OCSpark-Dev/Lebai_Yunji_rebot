@@ -16,7 +16,10 @@ import {
   GripperBody,
   HeartbeatBody,
   HelloBody,
+  MAX_MOTION_ACK_TIMEOUT_MS,
   MAX_WATCHDOG_MS,
+  MIN_MOTION_ACK_TIMEOUT_MS,
+  MOTION_ACK_TIMEOUT_MARGIN_MS,
   OPERATOR_HOLD_MS,
   POSE_MAX_COMMAND_DELTA_RAD,
   POSE_MAX_INPUT_ANGULAR_RPS,
@@ -115,6 +118,24 @@ export class TeleopSnapshot {
 
 export type TeleopSnapshotListener = (snapshot: TeleopSnapshot) => void;
 
+class MotionInFlight {
+  seq: number;
+  type: string;
+  generation: number;
+  sentAtUptimeMs: number;
+  poseCalibrationId: string = '';
+  poseRelative: Quaternion4 | undefined = undefined;
+  poseSensorTimestampMs: number = 0;
+  poseDelta: Angular3 = new Angular3();
+
+  constructor(seq: number, type: string, generation: number, sentAtUptimeMs: number) {
+    this.seq = seq;
+    this.type = type;
+    this.generation = generation;
+    this.sentAtUptimeMs = sentAtUptimeMs;
+  }
+}
+
 export class TeleopClient {
   private static instance: TeleopClient = new TeleopClient();
   private socket: webSocket.WebSocket | undefined = undefined;
@@ -127,7 +148,9 @@ export class TeleopClient {
   private clientName: string = TeleopClient.defaultClientName();
   private nextSeq: number = 0;
   private lastServerSeq: number = -1;
-  private serverWallClockOffsetMs: number = 0;
+  private serverTimeAtWelcomeMs: number = 0;
+  private serverWelcomeUptimeMs: number = -1;
+  private lastOutboundServerTimeMs: number = 0;
   private commandTimerId: number = -1;
   private connectTimerId: number = -1;
   private lastUiEmitAtUptimeMs: number = 0;
@@ -165,18 +188,19 @@ export class TeleopClient {
   private poseAccuracy: number = 0;
   private poseConfidence: number = 0;
   private poseLastSensorTimestampMs: number = 0;
-  private poseLastSentSensorTimestampMs: number = 0;
+  private poseLastAckedSensorTimestampMs: number = 0;
   private poseLatestQuaternion: Quaternion4 | undefined = undefined;
   private posePreviousRawQuaternion: Quaternion4 | undefined = undefined;
   private poseCalibrationQuaternion: Quaternion4 | undefined = undefined;
-  private posePreviousSentRelative: Quaternion4 | undefined = undefined;
+  private posePreviousAckedRelative: Quaternion4 | undefined = undefined;
   private poseCalibrationId: string = '';
   private poseDeadmanHeld: boolean = false;
   private poseDeadmanTouchId: number = -1;
   private posePrimePending: boolean = false;
   private poseLastDelta: Angular3 = new Angular3();
   private poseSensorStatus: string = '姿态传感器未启用';
-  private pendingPoseAckSeqs: Array<number> = [];
+  private motionGeneration: number = 0;
+  private motionInFlight: MotionInFlight | undefined = undefined;
   private activeAxis: string = AxisName.NONE;
   private axisDirection: number = 0;
   private axisTouchId: number = -1;
@@ -384,8 +408,8 @@ export class TeleopClient {
       return;
     }
     this.poseCalibrationQuaternion = this.copyQuaternion(latest);
-    this.posePreviousSentRelative = undefined;
-    this.poseLastSentSensorTimestampMs = 0;
+    this.posePreviousAckedRelative = undefined;
+    this.poseLastAckedSensorTimestampMs = 0;
     this.posePrimePending = true;
     this.poseLastDelta = new Angular3();
     this.poseCalibrationId = `harmony-pose-${Date.now()}-${Math.round(nowUptimeMs)}`;
@@ -403,8 +427,8 @@ export class TeleopClient {
       }
       this.poseDeadmanHeld = false;
       this.poseDeadmanTouchId = -1;
-      this.posePreviousSentRelative = undefined;
-      this.poseLastSentSensorTimestampMs = 0;
+      this.posePreviousAckedRelative = undefined;
+      this.poseLastAckedSensorTimestampMs = 0;
       this.posePrimePending = true;
       this.poseLastDelta = new Angular3();
       this.lastEvent = '姿态 DEADMAN 已松开，已发送 stop';
@@ -436,11 +460,11 @@ export class TeleopClient {
     }
     this.poseDeadmanHeld = true;
     this.poseDeadmanTouchId = touchId;
-    this.posePreviousSentRelative = this.copyQuaternion(relative);
-    this.poseLastSentSensorTimestampMs = 0;
+    this.posePreviousAckedRelative = this.copyQuaternion(relative);
+    this.poseLastAckedSensorTimestampMs = 0;
     this.posePrimePending = true;
     this.poseLastDelta = new Angular3();
-    this.lastEvent = '姿态 DEADMAN 按住；首帧只做 priming，随后 20 Hz 发送旋转增量';
+    this.lastEvent = '姿态 DEADMAN 按住；首帧只做 priming，随后最多 20 Hz 且单帧等待 ACK';
     this.emitSnapshot();
   }
 
@@ -472,7 +496,7 @@ export class TeleopClient {
     this.activeAxis = axis;
     this.axisDirection = direction;
     this.axisTouchId = touchId;
-    this.lastEvent = `按住 ${axis}${direction > 0 ? '+' : '-'}，20 Hz 发送`;
+    this.lastEvent = `按住 ${axis}${direction > 0 ? '+' : '-'}，最多 20 Hz 且单帧等待 ACK`;
     this.emitSnapshot();
   }
 
@@ -669,16 +693,31 @@ export class TeleopClient {
         return;
       }
       const ackType = body.ack_type;
-      if (ackType === 'pose.sample') {
-        this.removePendingPoseAck(body.ack_seq);
+      const pending = this.motionInFlight;
+      const matchedMotionAck = pending !== undefined && pending.seq === body.ack_seq && pending.type === ackType;
+      let retryLatestMotion = false;
+      if (matchedMotionAck && pending !== undefined) {
+        this.motionInFlight = undefined;
+        if (!body.accepted) {
+          this.failClosed('command_rejected', true);
+          return;
+        }
+        if (pending.generation === this.motionGeneration) {
+          if (pending.type === 'pose.sample') {
+            this.commitAcknowledgedPose(pending);
+          }
+          retryLatestMotion = this.isAnyMotionActive();
+        }
       }
       const detail = body.detail ? `：${body.detail}` : '';
       this.lastEvent = `${body.accepted ? 'ACK' : '拒绝'} ${ackType}${body.clamped ? '（服务端已限幅）' : ''}${detail}`;
-      if (!body.accepted &&
-        (ackType.startsWith('motion.') || ackType === 'gripper.set' || ackType === 'pose.sample')) {
+      if (!body.accepted && ackType === 'gripper.set') {
         this.failClosed('command_rejected', true);
       } else {
         this.emitSnapshot();
+        if (retryLatestMotion) {
+          this.commandTick();
+        }
       }
     } else if (envelope.type === 'error') {
       const body = validateErrorBody(envelope.body);
@@ -687,9 +726,11 @@ export class TeleopClient {
         return;
       }
       const errorText = `server_error:${body.code}:${body.message}`;
-      const poseCommandError = body.ack_seq !== undefined && this.removePendingPoseAck(body.ack_seq);
-      if (poseCommandError || this.poseDeadmanHeld) {
-        this.failClosed(`pose_server_error:${body.code}`, true);
+      const pending = this.motionInFlight;
+      const motionCommandError = body.ack_seq !== undefined && pending !== undefined &&
+        pending.seq === body.ack_seq;
+      if (motionCommandError) {
+        this.failClosed(`motion_server_error:${body.code}`, true);
       } else if (body.recoverable) {
         this.lastEvent = errorText;
         this.emitSnapshot();
@@ -720,7 +761,15 @@ export class TeleopClient {
       this.closeSocket('unsafe_welcome_parameters', true);
       return;
     }
-    this.serverWallClockOffsetMs = body.server_time_ms - Date.now();
+    const welcomeUptimeMs = this.monotonicNowMs();
+    if (welcomeUptimeMs < 0) {
+      this.lastEvent = '无法读取设备单调时钟，连接已关闭';
+      this.closeSocket('monotonic_clock_unavailable', true);
+      return;
+    }
+    this.serverTimeAtWelcomeMs = body.server_time_ms;
+    this.serverWelcomeUptimeMs = welcomeUptimeMs;
+    this.lastOutboundServerTimeMs = body.server_time_ms;
     this.clearConnectTimer();
     this.welcomed = true;
     this.connectionState = '协议已就绪';
@@ -826,6 +875,19 @@ export class TeleopClient {
       return;
     }
 
+    const pending = this.motionInFlight;
+    if (pending !== undefined) {
+      const pendingAgeMs = nowUptimeMs - pending.sentAtUptimeMs;
+      if (pendingAgeMs < 0 || pendingAgeMs >= this.motionAckTimeoutMs()) {
+        this.failClosed('motion_ack_timeout', true);
+        return;
+      }
+      if (nowUptimeMs - this.lastUiEmitAtUptimeMs >= 250) {
+        this.emitSnapshot();
+      }
+      return;
+    }
+
     if (poseMoving && this.hasSafeLease(true) &&
       nowUptimeMs - this.lastMotionSentAtUptimeMs >= POSE_SAMPLE_PERIOD_MS) {
       this.sendPoseSample(nowUptimeMs);
@@ -847,8 +909,21 @@ export class TeleopClient {
       } else if (this.activeAxis === AxisName.RZ) {
         angular.rz = profile.angularRps * this.axisDirection;
       }
-      this.sendEnvelope('motion.cartesian_velocity', new VelocityBody(this.leaseId, linear, angular));
-      this.lastMotionSentAtUptimeMs = nowUptimeMs;
+      const generation = this.motionGeneration;
+      const sequence = this.sendEnvelope(
+        'motion.cartesian_velocity',
+        new VelocityBody(this.leaseId, linear, angular)
+      );
+      if (sequence !== undefined && generation === this.motionGeneration && this.motionInFlight === undefined &&
+        this.deadmanHeld && this.activeAxis !== AxisName.NONE) {
+        this.motionInFlight = new MotionInFlight(
+          sequence,
+          'motion.cartesian_velocity',
+          generation,
+          nowUptimeMs
+        );
+        this.lastMotionSentAtUptimeMs = nowUptimeMs;
+      }
     } else if (!moving && nowUptimeMs - this.lastHeartbeatAtUptimeMs >= 250) {
       this.sendEnvelope('heartbeat', new HeartbeatBody(this.leaseId));
       this.lastHeartbeatAtUptimeMs = nowUptimeMs;
@@ -968,6 +1043,9 @@ export class TeleopClient {
   }
 
   private sendPoseSample(nowUptimeMs: number): void {
+    if (this.motionInFlight !== undefined) {
+      return;
+    }
     if (!this.canSendPoseSample()) {
       this.failClosed('pose_sample_gate_closed', true);
       return;
@@ -979,22 +1057,23 @@ export class TeleopClient {
     }
 
     let delta = new Angular3();
-    if (!this.posePrimePending && this.posePreviousSentRelative !== undefined) {
-      if (this.poseLastSensorTimestampMs === this.poseLastSentSensorTimestampMs) {
+    if (!this.posePrimePending && this.posePreviousAckedRelative !== undefined) {
+      if (this.poseLastSensorTimestampMs === this.poseLastAckedSensorTimestampMs) {
         return;
       }
-      const sensorIntervalMs = this.poseLastSensorTimestampMs - this.poseLastSentSensorTimestampMs;
+      const sensorIntervalMs = this.poseLastSensorTimestampMs - this.poseLastAckedSensorTimestampMs;
       if (sensorIntervalMs < POSE_MIN_SENT_INTERVAL_MS) {
         return;
       }
-      if (sensorIntervalMs > POSE_MAX_SENT_INTERVAL_MS) {
+      const maxPoseIntervalMs = Math.min(POSE_MAX_SENT_INTERVAL_MS, this.watchdogMs);
+      if (sensorIntervalMs > maxPoseIntervalMs) {
         this.clearPoseCalibration();
-        this.failClosed('pose_sent_sample_interval_invalid', true);
+        this.failClosed('pose_acknowledged_sample_interval_invalid', true);
         return;
       }
       const deltaQuaternion = this.multiplyQuaternion(
         relative,
-        this.inverseQuaternion(this.posePreviousSentRelative)
+        this.inverseQuaternion(this.posePreviousAckedRelative)
       );
       delta = this.mapPhoneDeltaToTcp(this.quaternionToRotationVector(deltaQuaternion));
       if (this.angularMagnitude(delta) > POSE_MAX_COMMAND_DELTA_RAD) {
@@ -1010,24 +1089,22 @@ export class TeleopClient {
       }
     }
 
-    const poseSequence = this.nextSeq;
-    const sent = this.sendEnvelope('pose.sample', new PoseSampleBody(
+    const generation = this.motionGeneration;
+    const poseSequence = this.sendEnvelope('pose.sample', new PoseSampleBody(
       this.leaseId,
       this.poseCalibrationId,
       this.poseLastSensorTimestampMs,
       this.poseConfidence,
       delta
     ));
-    if (sent) {
-      this.pendingPoseAckSeqs.push(poseSequence);
-      if (this.pendingPoseAckSeqs.length > 32) {
-        this.failClosed('pose_ack_backlog', true);
-        return;
-      }
-      this.posePreviousSentRelative = this.copyQuaternion(relative);
-      this.poseLastSentSensorTimestampMs = this.poseLastSensorTimestampMs;
-      this.posePrimePending = false;
-      this.poseLastDelta = delta;
+    if (poseSequence !== undefined && generation === this.motionGeneration && this.motionInFlight === undefined &&
+      this.poseDeadmanHeld && this.poseCalibrationId.length > 0) {
+      const pending = new MotionInFlight(poseSequence, 'pose.sample', generation, nowUptimeMs);
+      pending.poseCalibrationId = this.poseCalibrationId;
+      pending.poseRelative = this.copyQuaternion(relative);
+      pending.poseSensorTimestampMs = this.poseLastSensorTimestampMs;
+      pending.poseDelta = this.copyAngular(delta);
+      this.motionInFlight = pending;
       this.lastMotionSentAtUptimeMs = nowUptimeMs;
     }
   }
@@ -1182,13 +1259,38 @@ export class TeleopClient {
     return result;
   }
 
-  private removePendingPoseAck(sequence: number): boolean {
-    const index = this.pendingPoseAckSeqs.indexOf(sequence);
-    if (index < 0) {
-      return false;
+  private copyAngular(value: Angular3): Angular3 {
+    const result = new Angular3();
+    result.rx = value.rx;
+    result.ry = value.ry;
+    result.rz = value.rz;
+    return result;
+  }
+
+  private commitAcknowledgedPose(pending: MotionInFlight): void {
+    if (!this.poseDeadmanHeld || pending.poseCalibrationId !== this.poseCalibrationId ||
+      pending.poseRelative === undefined || pending.poseSensorTimestampMs <= 0) {
+      return;
     }
-    this.pendingPoseAckSeqs.splice(index, 1);
-    return true;
+    // An accepted lm3-teleop.v1 ACK (including clamped=true) advances only the
+    // network-acknowledged phone baseline. The v1 ACK does not expose the exact
+    // physical rotation executed by the robot, so this is not robot pose closure.
+    this.posePreviousAckedRelative = this.copyQuaternion(pending.poseRelative);
+    this.poseLastAckedSensorTimestampMs = pending.poseSensorTimestampMs;
+    this.posePrimePending = false;
+    this.poseLastDelta = this.copyAngular(pending.poseDelta);
+  }
+
+  private motionAckTimeoutMs(): number {
+    return Math.max(
+      MIN_MOTION_ACK_TIMEOUT_MS,
+      Math.min(MAX_MOTION_ACK_TIMEOUT_MS, this.watchdogMs - MOTION_ACK_TIMEOUT_MARGIN_MS)
+    );
+  }
+
+  private invalidateMotionCredit(): void {
+    this.motionGeneration += 1;
+    this.motionInFlight = undefined;
   }
 
   private emitSnapshotThrottled(nowUptimeMs: number): void {
@@ -1202,14 +1304,17 @@ export class TeleopClient {
   }
 
   private sendStop(reason: string): void {
+    // Stop is deliberately outside the single-slot motion credit. Invalidate
+    // the slot first so a delayed ACK cannot revive or advance old input.
+    this.invalidateMotionCredit();
     if (this.connected && this.welcomed) {
       this.sendEnvelope('motion.stop', new StopBody(this.leaseId, reason));
     }
   }
 
-  private sendEnvelope(type: string, body: Object): boolean {
+  private sendEnvelope(type: string, body: Object): number | undefined {
     if (!this.connected || this.socket === undefined) {
-      return false;
+      return undefined;
     }
     const sequence = this.nextSeq;
     this.nextSeq += 1;
@@ -1225,10 +1330,10 @@ export class TeleopClient {
           this.failSendTransport(error ? `发送失败：${error.code}` : '发送失败：未确认');
         }
       });
-      return true;
+      return sequence;
     } catch (error) {
       this.failSendTransport(`发送异常：${JSON.stringify(error)}`);
-      return false;
+      return undefined;
     }
   }
 
@@ -1273,7 +1378,15 @@ export class TeleopClient {
     if (type === 'session.hello') {
       return localNowMs;
     }
-    return localNowMs + this.serverWallClockOffsetMs;
+    const nowUptimeMs = this.monotonicNowMs();
+    if (this.serverTimeAtWelcomeMs <= 0 || this.serverWelcomeUptimeMs < 0 || nowUptimeMs < 0) {
+      return Math.max(localNowMs, this.lastOutboundServerTimeMs);
+    }
+    const elapsedMs = Math.max(0, nowUptimeMs - this.serverWelcomeUptimeMs);
+    const candidate = this.serverTimeAtWelcomeMs + elapsedMs;
+    const stableTimestamp = Math.max(candidate, this.lastOutboundServerTimeMs);
+    this.lastOutboundServerTimeMs = stableTimestamp;
+    return stableTimestamp;
   }
 
   private failClosed(reason: string, clearLease: boolean): void {
@@ -1294,7 +1407,6 @@ export class TeleopClient {
     this.axisTouchId = -1;
     this.recording = false;
     this.clearPoseCalibration();
-    this.pendingPoseAckSeqs = [];
     if (clearLease) {
       this.leaseId = '';
       this.leaseExpiresAtMs = 0;
@@ -1370,6 +1482,7 @@ export class TeleopClient {
   }
 
   private clearLocalControl(): void {
+    this.invalidateMotionCredit();
     this.leaseId = '';
     this.leaseExpiresAtMs = 0;
     this.leaseDeadlineUptimeMs = 0;
@@ -1381,14 +1494,15 @@ export class TeleopClient {
     this.axisDirection = 0;
     this.axisTouchId = -1;
     this.clearPoseCalibration();
-    this.pendingPoseAckSeqs = [];
   }
 
   private resetConnectionState(): void {
     this.stopPoseSensorInternal(true);
     this.connected = false;
     this.welcomed = false;
-    this.serverWallClockOffsetMs = 0;
+    this.serverTimeAtWelcomeMs = 0;
+    this.serverWelcomeUptimeMs = -1;
+    this.lastOutboundServerTimeMs = 0;
     this.sessionId = '';
     this.serverMode = '-';
     this.watchdogMs = 0;
@@ -1422,7 +1536,7 @@ export class TeleopClient {
     this.poseAccuracy = 0;
     this.poseConfidence = 0;
     this.poseLastSensorTimestampMs = 0;
-    this.poseLastSentSensorTimestampMs = 0;
+    this.poseLastAckedSensorTimestampMs = 0;
     this.poseLatestQuaternion = undefined;
     this.posePreviousRawQuaternion = undefined;
     this.poseDeadmanHeld = false;
@@ -1435,8 +1549,8 @@ export class TeleopClient {
 
   private clearPoseCalibration(): void {
     this.poseCalibrationQuaternion = undefined;
-    this.posePreviousSentRelative = undefined;
-    this.poseLastSentSensorTimestampMs = 0;
+    this.posePreviousAckedRelative = undefined;
+    this.poseLastAckedSensorTimestampMs = 0;
     this.poseCalibrationId = '';
     this.posePrimePending = false;
     this.poseLastDelta = new Angular3();

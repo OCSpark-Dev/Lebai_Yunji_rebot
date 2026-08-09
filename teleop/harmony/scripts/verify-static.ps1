@@ -16,6 +16,14 @@ $index = Get-Content -Raw -Encoding utf8 -LiteralPath $indexPath
 $ability = Get-Content -Raw -Encoding utf8 -LiteralPath $abilityPath
 $poseSensor = Get-Content -Raw -Encoding utf8 -LiteralPath $poseSensorPath
 $module = Get-Content -Raw -Encoding utf8 -LiteralPath $modulePath
+$sendPoseMethod = ([regex]::Match(
+  $client,
+  '(?s)private sendPoseSample\(nowUptimeMs: number\): void \{.*?(?=\r?\n  private canCalibratePose\()'
+)).Value
+$sendStopMethod = ([regex]::Match(
+  $client,
+  '(?s)private sendStop\(reason: string\): void \{.*?(?=\r?\n  private sendEnvelope\()'
+)).Value
 
 # Keep this script ASCII-only so it parses consistently in Windows PowerShell 5.1.
 function Multiply-Quaternion([double[]]$left, [double[]]$right) {
@@ -47,6 +55,23 @@ $phoneVector = [double[]]@(0.1, 0.2, 0.3)
 $tcpVector = [double[]]@($phoneVector[1], -$phoneVector[0], $phoneVector[2])
 $poseAxisMappingExecutablePassed = [Math]::Abs($tcpVector[0] - 0.2) -lt 0.000001 -and
   [Math]::Abs($tcpVector[1] + 0.1) -lt 0.000001 -and [Math]::Abs($tcpVector[2] - 0.3) -lt 0.000001
+$pendingMotion = @{ seq = 42; type = 'pose.sample'; generation = 7 }
+$motionAckCorrelationExecutablePassed = (
+  $pendingMotion.seq -eq 42 -and $pendingMotion.type -eq 'pose.sample'
+) -and -not (
+  $pendingMotion.seq -eq 41 -and $pendingMotion.type -eq 'pose.sample'
+) -and -not (
+  $pendingMotion.seq -eq 42 -and $pendingMotion.type -eq 'motion.cartesian_velocity'
+) -and ($pendingMotion.generation -eq 7) -and -not ($pendingMotion.generation -eq 8)
+$motionAckDeadlineExecutablePassed = (
+  [Math]::Max(50, [Math]::Min(250, 300 - 50)) -eq 250
+) -and (
+  [Math]::Max(50, [Math]::Min(250, 200 - 50)) -eq 150
+) -and (
+  [Math]::Max(50, [Math]::Min(250, 40 - 50)) -eq 50
+) -and (
+  [Math]::Max(50, [Math]::Min(250, 1000 - 50)) -eq 250
+)
 
 $checks = [ordered]@{}
 
@@ -77,16 +102,21 @@ $checks['first outbound seq uses zero before increment'] = (
   $client.Contains('this.nextSeq += 1;') -and
   $client.Contains('encodeEnvelope(type, sequence, sentAtMs, body)')
 )
-$checks['welcome synchronizes outbound wall clock timestamps'] = (
-  $client.Contains('private serverWallClockOffsetMs: number = 0;') -and
-  $client.Contains('this.serverWallClockOffsetMs = body.server_time_ms - Date.now();') -and
+$checks['welcome synchronizes outbound timestamps from monotonic baseline'] = (
+  $client.Contains('private serverTimeAtWelcomeMs: number = 0;') -and
+  $client.Contains('private serverWelcomeUptimeMs: number = -1;') -and
+  $client.Contains('this.serverTimeAtWelcomeMs = body.server_time_ms;') -and
+  $client.Contains('this.serverWelcomeUptimeMs = welcomeUptimeMs;') -and
   $client.Contains('const sentAtMs = this.outboundWallClockNowMs(type);') -and
-  $client.Contains('return localNowMs + this.serverWallClockOffsetMs;')
+  $client.Contains('const elapsedMs = Math.max(0, nowUptimeMs - this.serverWelcomeUptimeMs);') -and
+  $client.Contains('const stableTimestamp = Math.max(candidate, this.lastOutboundServerTimeMs);')
 )
-$checks['hello stays on local wall clock and resets discard offset'] = (
+$checks['hello stays on local wall clock and reset discards server baseline'] = (
   $client.Contains("if (type === 'session.hello')") -and
   $client.Contains('return localNowMs;') -and
-  ([regex]::Matches($client, 'this\.serverWallClockOffsetMs = 0;')).Count -ge 4
+  $client.Contains('this.serverTimeAtWelcomeMs = 0;') -and
+  $client.Contains('this.serverWelcomeUptimeMs = -1;') -and
+  $client.Contains('this.lastOutboundServerTimeMs = 0;')
 )
 $checks['protocol encoder requires caller supplied timestamp'] = (
   $protocol.Contains('constructor(type: string, seq: number, sentAtMs: number, body: Object)') -and
@@ -155,10 +185,12 @@ $checks['active leased motion permits IDLE MOVING or RUNNING'] = (
   $client.Contains("this.robotMode === 'RUNNING'")
 )
 $checks['motion rate has monotonic 50 ms guard'] = (
-  $client.Contains('nowUptimeMs - this.lastMotionSentAtUptimeMs >= COMMAND_PERIOD_MS')
+  $client.Contains('nowUptimeMs - this.lastMotionSentAtUptimeMs >= COMMAND_PERIOD_MS') -and
+  $client.Contains('nowUptimeMs - this.lastMotionSentAtUptimeMs >= POSE_SAMPLE_PERIOD_MS')
 )
 $checks['motion uses canonical type'] = (
-  $client.Contains("sendEnvelope('motion.cartesian_velocity'")
+  $client.Contains("'motion.cartesian_velocity',") -and
+  $client.Contains("new VelocityBody(this.leaseId, linear, angular)")
 )
 $checks['stop uses canonical type'] = (
   $client.Contains("sendEnvelope('motion.stop'")
@@ -216,7 +248,7 @@ $checks['pose control requires explicit zero and held deadman'] = (
 )
 $checks['pose delta is left difference in calibrated frame'] = (
   $client.Contains('this.inverseQuaternion(this.poseCalibrationQuaternion)') -and
-  $client.Contains('this.inverseQuaternion(this.posePreviousSentRelative)') -and
+  $client.Contains('this.inverseQuaternion(this.posePreviousAckedRelative)') -and
   $client.Contains('this.posePrimePending = true;') -and
   $client.Contains('normalized.w < 0') -and
   $poseMathExecutablePassed
@@ -231,11 +263,13 @@ $checks['pose axis mapping is explicit y negative-x z'] = (
 )
 $checks['pose commands are limited to 20 Hz monotonic timestamps'] = (
   $protocol.Contains('POSE_SAMPLE_PERIOD_MS: number = COMMAND_PERIOD_MS') -and
+  $protocol.Contains('POSE_MAX_SENT_INTERVAL_MS: number = MAX_WATCHDOG_MS') -and
   $client.Contains('nowUptimeMs - this.lastMotionSentAtUptimeMs >= POSE_SAMPLE_PERIOD_MS') -and
   $client.Contains('this.poseLastSensorTimestampMs,') -and
-  $client.Contains('this.poseLastSensorTimestampMs === this.poseLastSentSensorTimestampMs') -and
+  $client.Contains('this.poseLastSensorTimestampMs === this.poseLastAckedSensorTimestampMs') -and
   $client.Contains('sensorIntervalMs < POSE_MIN_SENT_INTERVAL_MS') -and
-  $client.Contains('sensorIntervalMs > POSE_MAX_SENT_INTERVAL_MS') -and
+  $client.Contains('Math.min(POSE_MAX_SENT_INTERVAL_MS, this.watchdogMs)') -and
+  $client.Contains('sensorIntervalMs > maxPoseIntervalMs') -and
   $client.Contains('derivedAngularRps > POSE_MAX_INPUT_ANGULAR_RPS') -and
   $client.Contains("sendEnvelope('pose.sample'")
 )
@@ -260,17 +294,57 @@ $checks['pose lifecycle stops subscription and clears calibration'] = (
   $client.Contains('this.clearPoseCalibration();') -and
   $client.Contains("closeSocket('app_background', true)")
 )
-$checks['pose ACK and delayed errors are sequence correlated'] = (
-  $client.Contains('private pendingPoseAckSeqs: Array<number> = [];') -and
-  $client.Contains('const poseSequence = this.nextSeq;') -and
-  $client.Contains('this.pendingPoseAckSeqs.push(poseSequence);') -and
-  $client.Contains('this.pendingPoseAckSeqs.length > 32') -and
-  $client.Contains("ackType === 'pose.sample'") -and
-  $client.Contains('body.ack_seq !== undefined && this.removePendingPoseAck(body.ack_seq)') -and
-  $client.Contains('failClosed(`pose_server_error:${body.code}`, true)') -and
-  $client.Contains("failClosed('pose_ack_backlog', true)") -and
-  ([regex]::Matches($client, 'this.pendingPoseAckSeqs = \[\];')).Count -ge 2 -and
+$checks['continuous motion shares one exact ACK credit'] = (
+  $client.Contains('class MotionInFlight') -and
+  $client.Contains('private motionInFlight: MotionInFlight | undefined = undefined;') -and
+  $client.Contains("new MotionInFlight(") -and
+  $client.Contains("'motion.cartesian_velocity',") -and
+  $client.Contains("new MotionInFlight(poseSequence, 'pose.sample'") -and
+  $client.Contains('pending.seq === body.ack_seq && pending.type === ackType') -and
+  $client.Contains('this.motionInFlight = undefined;') -and
+  $client.Contains('retryLatestMotion = this.isAnyMotionActive();') -and
+  $client.Contains('if (retryLatestMotion)') -and
+  $client.Contains('this.commandTick();') -and
+  $motionAckCorrelationExecutablePassed
+)
+$checks['motion ACK deadline follows welcome watchdog'] = (
+  $protocol.Contains('MOTION_ACK_TIMEOUT_MARGIN_MS: number = 50') -and
+  $protocol.Contains('MIN_MOTION_ACK_TIMEOUT_MS: number = 50') -and
+  $protocol.Contains('MAX_MOTION_ACK_TIMEOUT_MS: number = 250') -and
+  $client.Contains('this.watchdogMs - MOTION_ACK_TIMEOUT_MARGIN_MS') -and
+  $client.Contains('pendingAgeMs >= this.motionAckTimeoutMs()') -and
+  $client.Contains("failClosed('motion_ack_timeout', true)") -and
+  $motionAckDeadlineExecutablePassed
+)
+$checks['motion errors hit only the current in-flight sequence'] = (
+  $client.Contains('body.ack_seq !== undefined && pending !== undefined') -and
+  $client.Contains('pending.seq === body.ack_seq;') -and
+  $client.Contains('failClosed(`motion_server_error:${body.code}`, true)') -and
+  -not $client.Contains('poseCommandError || this.poseDeadmanHeld')
+)
+$checks['stop bypasses credit and invalidates delayed ACK generations'] = (
+  $client.Contains('private motionGeneration: number = 0;') -and
+  $client.Contains('pending.generation === this.motionGeneration') -and
+  $client.Contains('this.motionGeneration += 1;') -and
+  $client.Contains('this.motionInFlight = undefined;') -and
+  $sendStopMethod.Contains('this.invalidateMotionCredit();') -and
+  $sendStopMethod.Contains("sendEnvelope('motion.stop'") -and
+  $sendStopMethod.IndexOf('this.invalidateMotionCredit();') -lt
+    $sendStopMethod.IndexOf("sendEnvelope('motion.stop'") -and
   $client.Contains("closeSocket('send_transport_failure', false)")
+)
+$checks['pose baseline advances only after accepted exact ACK'] = (
+  $client.Contains('this.commitAcknowledgedPose(pending);') -and
+  $client.Contains('if (!body.accepted)') -and
+  $client.Contains('this.posePreviousAckedRelative = this.copyQuaternion(pending.poseRelative);') -and
+  $client.Contains('this.poseLastAckedSensorTimestampMs = pending.poseSensorTimestampMs;') -and
+  $client.Contains('including clamped=true') -and
+  $client.Contains('not robot pose closure') -and
+  $client.Contains('this.poseLatestQuaternion = normalized;') -and
+  $sendPoseMethod.Contains('const relative = this.currentRelativeQuaternion();') -and
+  $sendPoseMethod.Contains('if (this.motionInFlight !== undefined)') -and
+  -not $sendPoseMethod.Contains('this.posePreviousAckedRelative =') -and
+  -not $client.Contains('pendingPoseAckSeqs')
 )
 $checks['pose UI states rotation only and simulator axis check'] = (
   $index.Contains('this.client.startPoseSensor()') -and

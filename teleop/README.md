@@ -11,7 +11,9 @@
 - 使用官方 LeRobot API 的 LeRobot v3 导出器实现，目标格式供 LingBot-VLA 后训练使用；当前尚未完成官方 LeRobot v0.4.2 + FFmpeg 在 Windows 上的完整导出/回读 E2E；
 - 协议、租约、DEADMAN、限速、工作空间、关节限位和 watchdog 测试。
 
-当前没有连接 LM3-UP 真机，也没有验证无线延迟、实体触控、机械臂运动、夹爪、相机同步或 LingBot 真机端到端执行。软件停止不能替代物理急停。
+2026-08-09 已完成一轮 LM3-UP 真机联调：Windows Bridge 通过 `pylebai` 读取到控制器 `IDLE`、六轴零速和当前 TCP；Android 真机通过局域网 WebSocket 完成握手，按当前静止姿态刷新本地小包络后，控制租约已实际授予并连续续租超过 60 秒。静止持租验证后，现场曾按下运动 DEADMAN；旧客户端以 20 Hz 发送、而真机状态读取约需 139 ms，积压帧触发 `STALE_MESSAGE` 并安全撤租，因此本轮没有完成运动方向验收。事后多次复核均为六轴零速、TCP 无变化，也没有发送夹爪动作。部署单槽 ACK credit 客户端和有界快照 Bridge 后，又在当前静止 TCP 小包络内完成超过 2 分钟的 Android 真机静止持租验证，期间没有 `STALE_MESSAGE`、`LEASE_REQUIRED`、watchdog、撤租或断线；尚未据此宣称非零运动已经验收。
+
+当前仍未验收实体机械臂运动方向、无线运动时延/停止距离、夹爪中途停止、相机同步或 LingBot 真机端到端执行。软件停止不能替代物理急停。
 
 夹爪特别说明：当前 `gripper.set` 的 DEADMAN 只授权发送一次目标；松手、切后台或断线时发送的 `motion.stop/stop_move` 只针对机械臂轨迹，不能承诺中途停止 LMG-90。完成真机停止/保持、夹持力和人工解困验证前，夹爪控制只视为实验接口。
 
@@ -110,6 +112,13 @@ Android 和 HarmonyOS 客户端具有相同的操作语义：
 8. 松手、切后台、断线、传感器陈旧/跳变、状态过期或安全事件时立即本地清零并尽力发送停止。
 
 具体构建方式见 [`android/README.md`](android/README.md) 和 [`harmony/README.md`](harmony/README.md)。`pose.sample` 已用于手机 3DoF 旋转增量，不包含手机平移。Rotation Vector 是系统融合姿态；它不能替代 ARKit/ARCore/WebXR 的空间位置跟踪，也不能被描述成完整 6DoF。
+
+### 控制权立即丢失或出现 `LEASE_REQUIRED`
+
+- 先看 App 保留的首个 `control.status` / `safety.event`，以及 Bridge 的 `control.acquire`、`safe_stop`、`protocol.error` 日志；heartbeat 和自动清理 ACK 不再覆盖首因。
+- 如果机械臂曾被手动拖动或重新上电后姿态改变，旧 `.local.toml` 中围绕上一次 TCP 采样的小工作空间/姿态包络会立即失效。必须在机械臂静止、底盘锁定、现场安全时重新采样当前 TCP，更新本地包络并重启 Bridge；仅修改文件而不重启不会更新运行中配置。
+- 真机后端明显慢于手机 20 Hz 输入时，旧客户端会把运动帧排进 WebSocket，最终先触发 `STALE_MESSAGE`、再因安全撤租出现 `LEASE_REQUIRED`。Android/HarmonyOS 现对笛卡尔速度与姿态共用一个 ACK credit，同一时刻最多一条连续运动帧在途；Bridge 使用有界新鲜快照、在同一后端锁内完成校验和 `speedl`，并在执行前重新检查消息年龄与首帧在途 watchdog。
+- 安全层先撤租后，旧客户端继续发送 `control.release` 曾会收到二级 `LEASE_REQUIRED`，容易被误认为首因。当前 Bridge 已把“当前无租约”的旧 release 作为幂等成功处理，但绝不会允许一个会话释放其他会话的有效租约。
 
 ## 数据与 LingBot-VLA
 

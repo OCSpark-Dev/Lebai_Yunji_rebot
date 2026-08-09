@@ -1,5 +1,6 @@
 package com.lebai.lm3teleop.protocol
 
+import android.os.SystemClock
 import org.json.JSONArray
 import org.json.JSONObject
 import java.math.BigInteger
@@ -113,21 +114,30 @@ sealed class ServerMessage(
 class ProtocolException(message: String) : IllegalArgumentException(message)
 
 class ProtocolCodec(
+    private val monotonicClock: () -> Long = SystemClock::elapsedRealtime,
     private val clock: () -> Long = System::currentTimeMillis,
 ) {
+    private data class ServerClockBaseline(
+        val serverTimeMs: Long,
+        val monotonicTimeMs: Long,
+    )
+
     private val outboundSeq = AtomicLong(0)
-    private val clockOffsetMs = AtomicLong(0)
+    private var serverClockBaseline: ServerClockBaseline? = null
+    private var lastServerTimestampMs = Long.MIN_VALUE
     private var lastInboundSeq = -1L
     private var welcomeReceived = false
 
     @Synchronized
     fun reset() {
         outboundSeq.set(0)
-        clockOffsetMs.set(0)
+        serverClockBaseline = null
+        lastServerTimestampMs = Long.MIN_VALUE
         lastInboundSeq = -1L
         welcomeReceived = false
     }
 
+    @Synchronized
     fun encode(type: String, body: JSONObject): OutboundFrame {
         require(type.isNotBlank()) { "type must not be blank" }
         val seq = outboundSeq.getAndIncrement()
@@ -135,7 +145,7 @@ class ProtocolCodec(
             .put("protocol", TELEOP_PROTOCOL)
             .put("type", type)
             .put("seq", seq)
-            .put("sent_at_ms", clock() + clockOffsetMs.get())
+            .put("sent_at_ms", outboundTimestampMs(type))
             .put("body", body)
         return OutboundFrame(seq, type, envelope.toString())
     }
@@ -250,11 +260,43 @@ class ProtocolCodec(
             else -> throw ProtocolException("unknown server message type: $type")
         }
         if (message is ServerMessage.Welcome) {
-            clockOffsetMs.set(message.serverTimeMs - clock())
+            serverClockBaseline = ServerClockBaseline(
+                serverTimeMs = message.serverTimeMs,
+                monotonicTimeMs = monotonicClock(),
+            )
+            lastServerTimestampMs = message.serverTimeMs
         }
         lastInboundSeq = seq
         welcomeReceived = message is ServerMessage.Welcome || welcomeReceived
         return message
+    }
+
+    private fun outboundTimestampMs(type: String): Long {
+        if (type == "session.hello") return clock()
+        val baseline = serverClockBaseline ?: return clock()
+        val elapsedMs = saturatingElapsedMs(
+            baselineMs = baseline.monotonicTimeMs,
+            nowMs = monotonicClock(),
+        )
+        val candidate = saturatingAdd(baseline.serverTimeMs, elapsedMs)
+        val stableTimestamp = maxOf(candidate, lastServerTimestampMs)
+        lastServerTimestampMs = stableTimestamp
+        return stableTimestamp
+    }
+
+    private fun saturatingElapsedMs(baselineMs: Long, nowMs: Long): Long {
+        if (nowMs <= baselineMs) return 0L
+        val elapsedMs = nowMs - baselineMs
+        return if (elapsedMs < 0L) Long.MAX_VALUE else elapsedMs
+    }
+
+    private fun saturatingAdd(value: Long, nonNegativeDelta: Long): Long {
+        if (nonNegativeDelta <= 0L) return value
+        return if (value > Long.MAX_VALUE - nonNegativeDelta) {
+            Long.MAX_VALUE
+        } else {
+            value + nonNegativeDelta
+        }
     }
 }
 

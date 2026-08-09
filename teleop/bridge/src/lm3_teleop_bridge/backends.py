@@ -182,9 +182,19 @@ class HardwareBackend:
     def snapshot(self) -> RobotSnapshot:
         state_code = int(self._robot.get_robot_state())
         estop_raw = self._robot.get_estop_reason()
-        joints = _six_values(self._robot.get_actual_joint_positions(), "j")
-        speeds = _six_values(self._robot.get_actual_joint_speed(), "j")
-        tcp = _pose(self._robot.get_actual_tcp_pose())
+        native = getattr(self._robot, "native", None)
+        if native is None:
+            native = getattr(self._robot, "_native", None)
+        get_kin_data = getattr(native, "get_kin_data", None)
+        if callable(get_kin_data):
+            kin_data = get_kin_data()
+            joints = _six_values(_kin_data_value(kin_data, "actual_joint_pose"), "j")
+            speeds = _six_values(_kin_data_value(kin_data, "actual_joint_speed"), "j")
+            tcp = _pose(_kin_data_value(kin_data, "actual_tcp_pose"))
+        else:
+            joints = _six_values(self._robot.get_actual_joint_positions(), "j")
+            speeds = _six_values(self._robot.get_actual_joint_speed(), "j")
+            tcp = _pose(self._robot.get_actual_tcp_pose())
         gripper = _gripper_amplitude(self._robot.get_claw())
         return RobotSnapshot(
             robot_state=ROBOT_STATE_NAMES.get(state_code, f"UNKNOWN_{state_code}"),
@@ -242,6 +252,16 @@ def _six_values(value: Any, prefix: str) -> list[float]:
     if len(result) != 6 or not all(math.isfinite(item) for item in result):
         raise RuntimeError("Lebai backend returned an invalid six-axis vector")
     return result
+
+
+def _kin_data_value(value: Any, field: str) -> Any:
+    if isinstance(value, Mapping):
+        if field not in value:
+            raise RuntimeError(f"Lebai get_kin_data omitted {field}")
+        return value[field]
+    if not hasattr(value, field):
+        raise RuntimeError(f"Lebai get_kin_data omitted {field}")
+    return getattr(value, field)
 
 
 def _pose(value: Any) -> dict[str, float]:

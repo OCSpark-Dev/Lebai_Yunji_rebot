@@ -24,10 +24,11 @@ phone [x, y, z] -> TCP [rx, ry, rz] = [y, -x, z]
 - 只有机器人处于 `IDLE` 时才能申请控制权。已有租约并实际点动时可接受 `IDLE`、`MOVING` 或兼容桥接状态 `RUNNING`；未点动时仍只接受 `IDLE`，其他状态立即失败关闭。
 - 控制权必须通过 1500 ms 长按申请。触屏点动需要按住通用 DEADMAN 和单个轴键；陀螺仪姿态遥操使用另一个独立按住式“姿态 DEADMAN”，两种运动授权不能并发。
 - DEADMAN 与轴键分别绑定首次按下的触点 ID；其他触点不能接管或覆盖当前输入，同一时间只允许一个笛卡尔轴，夹爪命令也不能与轴向点动并发。
-- 姿态模式必须先显式归零。内部计算 `q_rel = inverse(q_zero) * q_current`，发送相邻已接受姿态的左差 `q_delta = q_rel_current * inverse(q_rel_previous)`，再取最短旋转向量。
-- 每次归零或重新按下姿态 DEADMAN 后，首个 `pose.sample` 发送零增量，只做 priming，不执行运动。松手会发送 `motion.stop` 并丢弃差分基线；再次按下必须重新 priming，不会补发松手期间的手机转动。
+- 姿态模式必须先显式归零。内部计算 `q_rel = inverse(q_zero) * q_current`，只从最近一次收到精确 `ack_seq`/`ack_type` 且 `accepted=true` 的网络确认基线，累计到最新传感器样本：`q_delta = q_rel_latest * inverse(q_rel_acked)`，再取最短旋转向量。
+- 每次归零或重新按下姿态 DEADMAN 后，首个 `pose.sample` 发送零增量，只做 priming，不执行运动。priming 也必须等对应 ACK；松手会立即发送 `motion.stop`、清除在途帧并递增本地 generation，旧 ACK 不能恢复旧输入。再次按下必须重新 priming，不会补发松手期间的手机转动。
 - 松开任一 DEADMAN、松开轴键、切换速度、安全状态变差、状态或租约过期、App 进入后台、WebSocket 出错/断开都会在本地立即清零，并尽力发送 `stop`。
-- 触屏 `motion.cartesian_velocity` 以 20 Hz 发送，单条命令持续 100 ms；姿态 `pose.sample` 最多 20 Hz，由服务端按 `20-150 ms` 传感器间隔换算角速度。服务端宣告的 watchdog 必须大于 0 且不超过 300 ms。
+- 触屏 `motion.cartesian_velocity` 与姿态 `pose.sample` 共用一个容量为 1 的 ACK credit：同一时刻最多一条连续运动帧在途，等待期间只更新最新触屏/传感器输入，不继续向 WebSocket 排队；精确匹配 ACK 后立即尝试发送最新输入。两者仍最多 20 Hz，触屏单条命令持续 100 ms；姿态由服务端按 `20 ms` 到 `min(300 ms, watchdog_ms)` 的已确认样本间隔换算角速度。
+- 在途运动 ACK 的本地期限为 `clamp(watchdog_ms - 50 ms, 50 ms, 250 ms)`；超时或 `error.ack_seq` 命中当前在途帧时立即 `motion.stop` 并释放租约。`motion.stop` 不占用 credit，松手/后台/断开路径不会等待运动 ACK。
 - 软件停止不能代替实体急停。真机调试必须由受训人员在实体急停可触达、空载、低速、底盘锁定的条件下进行。
 - 夹爪 DEADMAN 只授权发送一次 `gripper.set` 目标；松手/后台/断线后的 `motion.stop` 不能保证中途停止 LMG-90，真机前必须单独验证停止/保持和人工解困。
 
@@ -39,16 +40,17 @@ phone [x, y, z] -> TCP [rx, ry, rz] = [y, -x, z]
 | --- | ---: |
 | 最大样本年龄 | `150 ms` |
 | 最大原始采样间隔 | `250 ms` |
-| 相邻已发送传感器时间间隔 | `20-150 ms` |
+| 相邻网络确认基线到最新样本的时间间隔 | `20 ms` 到 `min(300 ms, watchdog_ms)` |
 | 原始姿态单次跳变 | `35°` |
 | 相对归零姿态范围 | `30°` |
 | 单帧发送旋转增量 | `12°` (`0.20944 rad`) |
 | 由增量/时间推导的输入角速度 | `<= 6 rad/s` |
 | 最低传感器精度 | `ACCURACY_MEDIUM=2`，协议 `confidence=0.8` |
 | 发送上限 | `20 Hz`，priming 帧也占用同一运动频率配额 |
-| 待 ACK 姿态命令上限 | `32` 条，超出即失败关闭 |
+| 连续运动在途上限 | `1` 条；触屏速度与姿态共用，`motion.stop` 绕过 |
+| 运动 ACK 期限 | `watchdog_ms - 50 ms`，并钳制到 `50-250 ms` |
 
-HarmonyOS `Response.timestamp` 是从设备启动到上报时的纳秒数。客户端先除以 `1_000_000` 转为毫秒，检查 JavaScript 安全整数和严格递增，再与 `systemDateTime.getUptime(TimeType.STARTUP)` 比较样本年龄。低精度、陈旧、时间倒退、间隔异常、非有限数、跳变、超出归零范围、发送失败、命令拒绝和与 `pose.sample` 序号匹配的延迟服务端错误都会失败关闭。
+HarmonyOS `Response.timestamp` 是从设备启动到上报时的纳秒数。客户端先除以 `1_000_000` 转为毫秒，检查 JavaScript 安全整数和严格递增，再与 `systemDateTime.getUptime(TimeType.STARTUP)` 比较样本年龄。低精度、陈旧、时间倒退、间隔异常、非有限数、跳变、超出归零范围、发送失败、命令拒绝、运动 ACK 超时和 `error.ack_seq` 命中当前在途运动都会失败关闭。`clamped=true` 的 accepted ACK 仍推进“手机网络确认基线”，但 v1 ACK 不包含机械臂实际执行旋转量，不能把该基线解释为机器人实测闭环位姿。
 
 ## 工程与构建
 
@@ -95,7 +97,9 @@ $env:Path="$env:JAVA_HOME\bin;$env:NODE_HOME;C:\Program Files\Huawei\DevEco Stud
 
 建立会话时，服务端首帧必须严格为 `session.welcome` 且 `seq=0`。握手被拒绝时，唯一允许的 welcome 前例外是 `error seq=0`：客户端会严格校验必填的 `code`、`message`、`recoverable`，并在可选 `ack_seq` 存在时校验其整数类型，再显示服务端的真实 `code/message` 并关闭连接；该错误帧不会建立会话。其他 welcome 前消息仍会被拒绝。welcome 之后同一方向、同一连接内的 `seq` 必须严格递增，重复 welcome 也会失败关闭。客户端只接受文本帧，并在分派前验证信封以及每一种服务端消息的必填字段、布尔类型、整数时间戳、有限数值、六维关节/TCP 数据和夹爪范围；非法消息、重复/倒退序号、未知消息类型和二进制消息都会失败关闭。
 
-`session.hello.sent_at_ms` 使用手机当前本地时间，便于服务端在尚未同步时完成首帧处理。welcome 验证成功后，客户端以 `server_time_ms - Date.now()` 计算当前连接的墙钟偏移，后续 `control.acquire`、heartbeat、运动、夹爪和录制等所有出站信封均带服务端对齐的 `sent_at_ms`。该偏移只属于当前 WebSocket 连接，不会被持久化或用于单调安全计时。
+`session.hello.sent_at_ms` 使用手机当前本地时间，便于服务端在尚未同步时完成首帧处理。welcome 验证成功后，客户端保存 `server_time_ms + 当前设备启动时钟` 基线；后续 `control.acquire`、heartbeat、运动、夹爪和录制等所有出站信封都用启动单调时钟推进服务端时间，并保证时间戳不倒退，因此用户修改系统时间不会让已建立会话突然产生陈旧/未来消息。该基线只属于当前 WebSocket 连接，不会持久化。
+
+连续运动回执必须同时精确匹配 `ack_seq` 与 `ack_type` 才能释放 credit；只有 `error.ack_seq` 命中当前在途序号时，才把可恢复错误升级为运动失败关闭。松手、后台、断开或任何安全停止都会清除在途项并递增 generation，因此迟到的旧 ACK/error 不会提交姿态基线，也不会解锁新一代运动。
 
 客户端发送：
 
@@ -132,9 +136,10 @@ HarmonyOS 客户端现已发送仅旋转的 `pose.sample`。它不接受手机�
 
 1. 只连接模拟网关，验证握手拒绝、协议错误、序号倒退、欢迎参数不兼容和断线都失败关闭。
 2. 验证四项检查未完成、状态陈旧、底盘未锁定、急停或错误码非零时不能取得租约。
-3. 在模拟器回放按下/松开触屏 DEADMAN、姿态 DEADMAN、每个轴键、显式归零、首帧 priming、重复传感器时间戳、低精度、样本陈旧、姿态跳变、App 后台和网络中断，确认客户端立即清零，服务端在 300 ms 内停止。
-4. 用模拟后端按标准握持姿态逐轴验证 `[y,-x,z]`，并检查松开后再按不会跳到松手期间的新姿态。
-5. 真机只做底盘锁定、空载、极慢档、小工作空间点动；记录实际 TCP、关节、夹爪反馈与停止延迟。
-6. 录制数据必须保留命令、实际反馈、陀螺仪 `calibration_id`/传感器时间/原始旋转增量、相机/服务端时间、网络间隔、watchdog 与异常标记。不能把被拒绝或被钳制的手机命令当成 VLA 训练真值。
+3. 在模拟器回放 50 ms 输入、约 139 ms ACK，确认 WebSocket 同时只有一条连续运动帧在途；错误 `ack_seq`/`ack_type` 不解锁，精确 ACK 后使用最新输入，超过 ACK 期限立即停止并撤租。
+4. 回放按下/松开触屏 DEADMAN、姿态 DEADMAN、每个轴键、显式归零、首帧 priming、重复传感器时间戳、低精度、样本陈旧、姿态跳变、App 后台和网络中断，确认客户端立即清零，旧 ACK 不提交基线，服务端在 300 ms 内停止。
+5. 用模拟后端按标准握持姿态逐轴验证 `[y,-x,z]`，并检查松开后再按不会跳到松手期间的新姿态。
+6. 真机只做底盘锁定、空载、极慢档、小工作空间点动；记录实际 TCP、关节、夹爪反馈与停止延迟。
+7. 录制数据必须保留命令、实际反馈、陀螺仪 `calibration_id`/传感器时间/原始旋转增量、相机/服务端时间、网络间隔、watchdog 与异常标记。不能把被拒绝或被钳制的手机命令当成 VLA 训练真值。
 
 当前仅启用经安全限幅的手机 3DoF 旋转增量。在完成模拟逐轴验向、延迟/跳变/失联停止验证和真机低速小工作空间验收前，不得扩展为手机平移或完整 6DoF 控制。
